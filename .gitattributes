@@ -1,0 +1,16 @@
+# 统一换行，避免跨平台踩坑
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF（且 启动.bat 是 GBK 编码，禁止任何转换）
+*.bat text eol=crlf
+start.bat text eol=crlf
+启动.bat -text
+
+# Shell 脚本必须 LF，否则 macOS / Linux 上执行报 bad interpreter
+*.sh text eol=lf
+*.command text eol=lf
+
+# 二进制
+*.jar binary
+*.png binary
+*.gz binary

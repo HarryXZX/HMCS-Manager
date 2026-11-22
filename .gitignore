@@ -1,0 +1,27 @@
+# 依赖
+node_modules/
+
+# 运行时产物
+last-url.txt
+*.log
+logs/
+
+# 本地数据：实例、核心 jar、世界、配置（绝不入库）
+servers/
+settings.json
+instances.json
+*.migrated
+*.bak
+
+# 临时 / 测试
+_dev/tmp-*/
+_dev/*.tmp
+*.part
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

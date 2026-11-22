@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HMCS Manager · Minecraft 服务端管理器</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233fb950'/%3E%3Cpath d='M9 22V10h3.2v4.6h6.6V10H22v12h-3.2v-4.6h-6.6V22z' fill='%23071409'/%3E%3C/svg%3E">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="mark">HY</div>
+      <div>
+        <b>HMCS Manager</b>
+        <span>Minecraft 服务端管理器</span>
+      </div>
+    </div>
+    <div class="sidebar-head">
+      <span>服务器实例</span>
+      <span id="inst-count" class="faint"></span>
+    </div>
+    <div class="inst-list" id="inst-list"></div>
+    <div class="sidebar-foot">
+      <button class="btn primary block" id="btn-new">+ 新建服务器</button>
+      <button class="btn ghost block" id="btn-import" style="margin-top:6px">导入已有服务端</button>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <div>
+        <div class="title" id="tb-title">载入中…</div>
+        <div class="sub" id="tb-sub"></div>
+      </div>
+      <div class="spacer"></div>
+      <div id="tb-chips"></div>
+      <div id="tb-actions"></div>
+    </header>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="overview">概览</button>
+      <button class="tab" data-tab="console">控制台</button>
+      <button class="tab" data-tab="files">文件</button>
+      <button class="tab" data-tab="config">配置</button>
+      <button class="tab" data-tab="plugins">插件</button>
+      <button class="tab" data-tab="world">世界</button>
+      <button class="tab" data-tab="network">网络</button>
+      <button class="tab" data-tab="settings">设置</button>
+    </nav>
+    <section id="view"></section>
+  </main>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>
