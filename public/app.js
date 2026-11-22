@@ -1358,11 +1358,19 @@ async function viewSettings(i) {
         </div>
         <div class="form-row"><label>配置目录（settings.json / instances.json）</label>
           <div class="path-row">
-            <input value="${esc(paths.appDir || '')}" readonly spellcheck="false">
+            <input value="${esc(paths.configDir || paths.appDir || '')}" readonly spellcheck="false">
             <button class="btn sm ghost" id="s-app-open">打开</button>
           </div>
-          <div class="tip">已从程序目录迁移到 <span class="mono">%APPDATA%\\HMCS</span>，程序目录被移动到别处也不会丢配置。</div>
+          <div class="tip">配置放在系统用户目录，程序目录被移动 / 重新下载都不会丢配置。</div>
         </div>
+        ${paths.dataDir && paths.dataDir !== (paths.configDir || paths.appDir) ? `
+        <div class="form-row"><label>数据目录（实例默认存放位置）</label>
+          <div class="path-row">
+            <input value="${esc(paths.dataDir)}" readonly spellcheck="false">
+            <button class="btn sm ghost" id="s-data-open">打开</button>
+          </div>
+          <div class="tip">Linux 按 XDG 规范把实例数据与配置分开存放；Windows / macOS 两者是同一个目录。</div>
+        </div>` : ''}
       </div>
     </div>
 
@@ -1486,7 +1494,8 @@ async function viewSettings(i) {
     if (p) $('#s-sdir').value = p;
   };
   $('#s-sdir-open').onclick = () => openDir($('#s-sdir').value.trim());
-  $('#s-app-open').onclick = () => openDir(paths.appDir || '');
+  $('#s-app-open').onclick = () => openDir(paths.configDir || paths.appDir || '');
+  if ($('#s-data-open')) $('#s-data-open').onclick = () => openDir(paths.dataDir || '');
 
   $('#s-add-client').onclick = async () => {
     const p = await pickDir({ title: '添加客户端实例目录', start: clientRoots[0] || '', hint: '选择 .minecraft 目录，或某个启动器实例的目录（含 saves 的那一层）。' });

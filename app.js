@@ -750,7 +750,7 @@ register('PUT', '/api/settings', async (req, res) => {
   // 服务端实例存放目录：必须是绝对路径，且能创建 / 可写
   if (typeof body.serversDir === 'string' && body.serversDir.trim()) {
     const dir = path.resolve(body.serversDir.trim());
-    if (!path.isAbsolute(body.serversDir.trim())) throw new Error('实例目录必须是绝对路径，例如 D:\\MinecraftServers');
+    if (!path.isAbsolute(body.serversDir.trim())) throw new Error('实例目录必须填绝对路径（例如 D:\\MinecraftServers 或 /srv/mc）');
     try {
       fs.mkdirSync(dir, { recursive: true });
       fs.accessSync(dir, fs.constants.W_OK);
@@ -843,7 +843,9 @@ function listen(port, attempt) {
     const url = `http://127.0.0.1:${port}`;
     console.log('HYCX MC Server Manager (HMCS) 已启动');
     console.log('  ' + url);
-    fs.writeFileSync(path.join(__dirname, 'last-url.txt'), url, 'utf8');
+    try {
+      fs.writeFileSync(path.join(__dirname, 'last-url.txt'), url, 'utf8');
+    } catch { /* 程序目录只读（如 /usr/lib、/opt）时不影响启动 */ }
   });
 }
 

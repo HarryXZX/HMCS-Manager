@@ -24,13 +24,15 @@ WebUI 只监听 `127.0.0.1`，不对外网开放；对外只暴露你显式映�
   start-macos.command macOS 双击启动
 ```
 
-数据目录（所有可变内容，**不在程序目录**，程序目录被移动也不会丢配置）：
+数据目录（所有可变内容，**都不在程序目录**，程序目录被移动也不会丢配置）：
 
-| 平台 | 数据目录 |
-| --- | --- |
-| Windows | `%APPDATA%\HMCS` |
-| macOS | `~/Library/Application Support/HMCS` |
-| Linux | `${XDG_CONFIG_HOME:-~/.config}/HMCS` |
+| 平台 | 配置（`settings.json` / `instances.json`） | 数据（`servers/`） |
+| --- | --- | --- |
+| Windows | `%APPDATA%\HMCS` | `%APPDATA%\HMCS` |
+| macOS | `~/Library/Application Support/HMCS` | 同左 |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/HMCS` | `${XDG_DATA_HOME:-~/.local/share}/HMCS` |
+
+Linux 按 [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/) 规范把配置与实例数据分开：配置小、值得备份；`servers/` 常是几十 GB 存档，归到 data 目录才不会被备份 / 同步工具当成配置一起搬。
 
 ```
   settings.json     应用设置（实例目录、客户端根目录、Java、内存）
@@ -38,7 +40,7 @@ WebUI 只监听 `127.0.0.1`，不对外网开放；对外只暴露你显式映�
   servers/          默认实例存放目录（可在设置里改成任意位置）
 ```
 
-环境变量 `HMCS_HOME` 可以把数据目录指到别处（旧名 `HYSERV_HOME` 仍然兼容）。
+环境变量 `HMCS_HOME` 可以把两者统一指到一个自定义目录（旧名 `HYSERV_HOME` 仍然兼容）。
 
 ## 启动方式
 
