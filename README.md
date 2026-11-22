@@ -54,6 +54,9 @@ Linux 按 [XDG Base Directory](https://specifications.freedesktop.org/basedir-sp
 脚本会检查 Node.js 版本（需要 **18+**）、依赖缺失时自动 `npm install`，启动后自动打开浏览器。
 没有 Node.js 时会直接提示安装地址，不会闪退。
 
+> Linux 发行版源里的 `nodejs` 常常太旧（Ubuntu 20.04 是 10.19）。没有 root 的话，把官方二进制解到
+> `~/opt` 再软链到 `~/.local/bin` 就行，不必装系统包；JDK 同理（`~/opt/jdk-21`，HMCS 会自动扫到）。
+
 **平台差异**：存档链接在 Windows 上用 NTFS 目录联接（Junction，不需要管理员权限），在 macOS / Linux 上用符号链接，效果一致；Java 探测会自动扫描各平台常见安装位置、`JAVA_HOME` 与 `PATH`。
 
 1. **新建服务器** → 选核心类型与 MC 版本 → 自动下载核心（Paper 26.3 约 55 MB，实测 36 秒）
@@ -216,9 +219,13 @@ Windows 上 `dgram` 的组播出口是**由系统挑的**，不是发到所有�
 
 ## 进程托管
 
-- 自动挑选 Java：优先 Mojang 官方运行时（`%APPDATA%\.minecraft\runtime`），26.x 要求 Java 25、1.21.x 要求 21，版本不足会拒绝启动
-- 强制 UTF-8：注入 `-Dstdout/stderr/stdin.encoding=UTF-8`，避免中文 Windows 下控制台与命令乱码
-- 日志：环形缓冲 4000 行 + SSE 实时推送；`stop` 指令优雅关闭，30 秒未退出才强杀
+- 自动挑选 Java：Windows 扫 Mojang 官方运行时（`%APPDATA%\.minecraft\runtime`）与 `Program Files`；Linux/macOS 扫
+  `/usr/lib/jvm`、`/Library/Java/JavaVirtualMachines`、Homebrew，以及**用户自己装的 JDK**（`~/opt`、`~/.jdks`（IntelliJ）、
+  SDKMAN、mise、jabba、Android Studio / JetBrains Toolbox 自带的 JBR）。26.x 要求 Java 25、1.21.x 要求 21，版本不足会拒绝启动
+- 强制 UTF-8：注入 `-Dstdout/stderr/stdin.encoding=UTF-8`，避免中文 Windows 下控制台与命令乱码；
+  Linux/macOS 另外注入 `-Dsun.jnu.encoding=UTF-8` 并把子进程 locale 兜底成 `C.UTF-8`——**否则从 SSH / systemd 这类
+  没有 locale 的环境启动时，中文世界名会直接 `InvalidPathException` 起不来**
+- 日志：环形缓冲 4000 行 + SSE 实时推送；`stop` 指令优雅关闭，启动阶段会每 3 秒补发一次，30 秒未退出才强杀
 - 状态判定：捕获 `Done (x.xxxs)!` 进入 `running`
 
 ## API 摘要
@@ -249,6 +256,24 @@ POST /api/reveal                        在资源管理器里打开路径
 GET  /api/clients                       探测本机客户端实例（只读建议）
 PUT  /api/settings                      保存设置（serversDir / clientRoots / extraWorldDirs / memory / javaPath）
 ```
+
+## Linux 实测（Ubuntu 20.04 无桌面机）
+
+不是"理论上支持"，是实际跑过一遍：
+
+| 项目 | 结果 |
+| --- | --- |
+| `./start.sh` 首次启动 | 自动 `npm install` → 起服务 → 只监听 `127.0.0.1:8720` |
+| 数据位置 | 配置 `~/.config/HMCS`、数据 `~/.local/share/HMCS`（XDG 规范），实例落在数据目录 |
+| Java 探测 | 只有系统 JDK 8 时能正确拒绝启动并提示"需要 Java 21+"；装到 `~/opt/jdk-21` 后自动识别 |
+| 核心下载 | Mojang 清单 + Vanilla 1.21.4 核心（54 MB）4 秒下完 |
+| 存档链接 | 建立的是**符号链接**（非 junction），`readlink` 指向真实存档，`level-name` 同步 |
+| 中文世界名 | 修复前 JVM 报 `InvalidPathException: unmappable characters`，修复后正常 |
+| 服务端启动 | `Done (1.03s)!`，状态切到 `running`，日志无 `\r` 残留、无乱码 |
+| 控制台 | `list` / `say` 有回显 |
+| 停止 | 连续 6 轮（含启动阶段中断）全部 `exit 0`，日志有 "Saving chunks"；修复前会卡 30 秒被强杀 |
+| UPnP | VM 在 NAT 后，探测优雅失败并给出中文提示，不阻塞、不报错 |
+| 前端 | 用 DOM 桩跑概览 / 设置页，无运行时错误 |
 
 ## 已知限制
 
