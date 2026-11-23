@@ -60,6 +60,7 @@ const sandbox = {
     // 登录态失效时 app.js 会 location.replace 到登录页，桩里得接住
     replace(u) { this.href = u; },
     assign(u) { this.href = u; },
+    reload() { this.reloaded = true; },
   },
   document: {
     querySelector: sel,

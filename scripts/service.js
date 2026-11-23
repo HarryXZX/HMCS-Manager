@@ -12,7 +12,7 @@
  *   node scripts/service.js status
  *
  * 选项：
- *   --port N          覆盖监听端口（写进服务启动参数）
+ *   --port N          覆盖监听端口（写进 settings.json，不是启动参数）
  *   --host ADDR       覆盖监听地址，默认沿用 settings.json
  *   --no-autostart    安装后不开机自启
  *   --user            Linux/macOS：装成当前用户的服务（不需要 root）
@@ -127,8 +127,10 @@ function writeState(obj) {
 
 const SAVED = readState();
 
-const PORT = Number(ARGS.port) || Number(SAVED.port) || Number(SETTINGS.port) || 8720;
-const HOST = String(ARGS.host || SAVED.host || SETTINGS.host || '127.0.0.1');
+// 端口 / 监听地址以 settings.json 为准（启动参数里不再带它们）。
+// SAVED 是安装时的存档，只作为 settings.json 缺失时的兜底，不能反过来压住新配置。
+const PORT = Number(ARGS.port) || Number(SETTINGS.port) || Number(SAVED.port) || 8720;
+const HOST = String(ARGS.host || SETTINGS.host || SAVED.host || '127.0.0.1');
 const LOCAL_ONLY = HOST === '127.0.0.1' || HOST === '::1';
 // systemd 的 --user 只有当前用户能装；root 默认装系统级
 const SCOPE = IS_WIN
@@ -239,8 +241,17 @@ async function gracefulStop(maxWaitSec = 70) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ------------------------------------------------------------------ 启动参数
+/**
+ * 启动参数
+ *
+ * 端口与监听地址**故意不写进启动参数**：命令行优先级高于 settings.json，
+ * 一旦写死，用户在界面里改完设置、点「重启」也还是被老参数压住，
+ * 表现就是「设置保存了但永远不生效」。
+ * 安装时把 PORT / HOST 写进 settings.json，之后由程序自己读，
+ * 界面改动 + 一键重启就能真正生效。
+ */
 function execArgs() {
-  const args = [APP, '--port', String(PORT), '--host', HOST, '--log-file'];
+  const args = [APP, '--log-file'];
   // Windows 服务跑在 SYSTEM 下，%APPDATA% 与安装者不同，必须把数据目录钉死
   if (IS_WIN) args.push('--home', CONFIG_DIR);
   return args;
@@ -264,7 +275,7 @@ const WIN = {
   },
 
   install() {
-    const tr = [quoteWin(NODE), quoteWin(APP), '--port', String(PORT), '--host', HOST, '--log-file', '--home', quoteWin(CONFIG_DIR)].join(' ');
+    const tr = [quoteWin(NODE), quoteWin(APP), '--log-file', '--home', quoteWin(CONFIG_DIR)].join(' ');
     const args = ['/Create', '/TN', WIN_TASK, '/TR', tr, '/SC', 'ONSTART', '/RU', 'SYSTEM', '/RL', 'HIGHEST', '/F'];
     const r = run('schtasks', args);
     if (r.code !== 0) {
@@ -367,8 +378,10 @@ function unitText() {
     `Environment=XDG_CONFIG_HOME=${home}/.config`,
     `Environment=XDG_DATA_HOME=${home}/.local/share`,
     `Environment=LANG=${process.env.LANG || 'C.UTF-8'}`,
-    `ExecStart=${NODE} ${APP} --port ${PORT} --host ${HOST} --log-file`,
-    'Restart=on-failure',
+    `ExecStart=${NODE} ${APP} --log-file`,
+    // 用 always 而不是 on-failure：界面上的「一键重启」在 systemd 下是主动 exit(0)，
+    // 交给 systemd 拉起；on-failure 会把它当成正常退出，服务就再也不回来了。
+    'Restart=always',
     'RestartSec=5',
     // 退出码 2 = 配置错误（端口占用、对外监听没密码），重启也没用，别死循环
     'RestartPreventExitStatus=2',
@@ -474,7 +487,7 @@ const MAC_PLIST = path.join(OWNER.home, 'Library', 'LaunchAgents', `${MAC_LABEL}
 
 function plistText(runAtLoad = true) {
   const logs = path.join(LOG_DIR, 'launchd.log');
-  const args = [NODE, APP, '--port', String(PORT), '--host', HOST, '--log-file'];
+  const args = [NODE, APP, '--log-file'];
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -577,6 +590,13 @@ async function cmdStatus() {
       say('  已运行    ' + (up >= 3600 ? `${Math.floor(up / 3600)} 小时 ${Math.floor(up % 3600 / 60)} 分` : `${Math.floor(up / 60)} 分 ${up % 60} 秒`));
       say('  密码      ' + (info.data.auth && info.data.auth.enabled ? c.green('已启用') : c.yellow('未启用')));
       if (Array.isArray(info.data.urls) && info.data.urls.length) say('  访问      ' + info.data.urls.join('  '));
+      // 运行中用的是什么，和 settings.json 里想要什么，可能不是一回事
+      const bind = info.data.bind || {};
+      if (Number(bind.port) && Number(bind.port) !== Number(SETTINGS.port)) {
+        say('');
+        warn(`正在运行的端口是 ${bind.port}，settings.json 里已经改成 ${SETTINGS.port}。`);
+        say('            到管理界面点「立即重启」即可生效（不用重装服务）。');
+      }
     } else {
       say('  版本      ' + c.dim('（端口有应答，但需要登录才能读取详情）'));
     }
@@ -584,10 +604,6 @@ async function cmdStatus() {
     say('  访问      ' + c.dim('127.0.0.1:' + PORT + ' 无应答'));
   }
   say('  日志      ' + (fs.existsSync(path.join(LOG_DIR, 'manager.log')) ? path.join(LOG_DIR, 'manager.log') : c.dim('尚未生成')));
-  if (SAVED.port && Number(SETTINGS.port) !== Number(SAVED.port)) {
-    warn(`settings.json 里的端口是 ${SETTINGS.port}，但服务注册时用的是 ${SAVED.port}。`);
-    say('            服务以注册时的参数启动；要改端口，用 install --port 新端口 重装一次。');
-  }
   line();
 }
 
@@ -620,8 +636,17 @@ async function cmdInstall() {
   // 已安装则先停掉，避免端口占用导致新实例起不来
   const before = BACKEND.describe();
   if (ARGS.dryRun) return dryRunPlan();
-  if (before.installed) {
-    say(c.dim('  检测到已安装，先停止旧实例…'));
+
+  // 端口与监听地址落进 settings.json：启动参数里不再出现，之后由程序自己读，
+  // 这样在界面改完设置点「重启」就能真正生效
+  try {
+    paths.writeSettings({ port: PORT, host: HOST });
+    say('  已写入    settings.json（port=' + PORT + ', host=' + HOST + '）');
+  } catch (e) {
+    warn('写 settings.json 失败：' + e.message + '（服务会沿用文件里原有的端口）');
+  }
+
+  if (before.installed) {    say(c.dim('  检测到已安装，先停止旧实例…'));
     await gracefulStop(70);
     BACKEND.hardStop();
     await sleep(800);
@@ -664,7 +689,10 @@ function dryRunPlan() {
   say('');
 
   if (IS_WIN) {
-    const tr = [quoteWin(NODE), quoteWin(APP), '--port', String(PORT), '--host', HOST, '--log-file', '--home', quoteWin(CONFIG_DIR)].join(' ');
+    const tr = [quoteWin(NODE), quoteWin(APP), '--log-file', '--home', quoteWin(CONFIG_DIR)].join(' ');
+    say('  写入 settings.json：port=' + PORT + '，host=' + HOST);
+    say('  （启动参数里不带端口 —— 以后在界面改完点「重启」才真正生效）');
+    say('');
     say('  注册计划任务（开机启动 + SYSTEM 账户，不需要登录）：');
     say(c.cyan('    schtasks /Create /TN ' + WIN_TASK + ' /TR "' + tr + '" /SC ONSTART /RU SYSTEM /RL HIGHEST /F'));
     if (!ARGS.autostart) say(c.cyan('    schtasks /Change /TN ' + WIN_TASK + ' /DISABLE'));
@@ -677,6 +705,8 @@ function dryRunPlan() {
   }
 
   if (IS_MAC) {
+    say('  写入 settings.json：port=' + PORT + '，host=' + HOST);
+    say('');
     say('  写入 ' + MAC_PLIST + '：');
     say('');
     for (const l of plistText(ARGS.autostart).replace(/\n$/, '').split('\n')) say('    ' + l);
@@ -688,6 +718,8 @@ function dryRunPlan() {
 
   const cmd = SCOPE === 'system' ? 'systemctl' : 'systemctl --user';
   const priv = SCOPE === 'system' && typeof process.getuid === 'function' && process.getuid() !== 0 ? 'sudo ' : '';
+  say('  写入 settings.json：port=' + PORT + '，host=' + HOST);
+  say('');
   say('  写入 ' + unitPath() + '：');
   say('');
   for (const l of unitText().replace(/\n$/, '').split('\n')) say('    ' + l);
@@ -782,6 +814,7 @@ async function menu() {
     say('  5) 查看状态');
     say('  6) 卸载服务');
     say('  7) 打开管理界面');
+    say('  8) 安装 hmcsm 命令到 PATH');
     say('  q) 退出');
     say('');
 
@@ -802,6 +835,7 @@ async function menu() {
           if (await ask('  确认卸载服务？(y/N)：', 'n') === 'y') cmdUninstall();
           break;
         case '7': openBrowser(); break;
+        case '8': installCli(); break;
         default: warn('没有这个选项');
       }
     } catch (e) {
@@ -810,8 +844,14 @@ async function menu() {
   }
 }
 
-function openBrowser() {
-  const url = `http://127.0.0.1:${PORT}`;
+/** 把 hmcsm 命令装进 PATH（具体逻辑都在 install-cli.js 里） */
+function installCli() {
+  const script = path.join(__dirname, 'install-cli.js');
+  const r = spawnSync(process.execPath, [script, 'install'], { stdio: 'inherit' });
+  if (r.status !== 0) warn('hmcsm 命令安装失败，可手动运行：node scripts/install-cli.js install');
+}
+
+function openBrowser() {  const url = `http://127.0.0.1:${PORT}`;
   try {
     if (IS_WIN) spawnSync('cmd', ['/c', 'start', '', url], { windowsHide: true });
     else if (IS_MAC) spawnSync('open', [url]);

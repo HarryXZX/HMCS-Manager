@@ -61,11 +61,39 @@ Linux 按 [XDG Base Directory](https://specifications.freedesktop.org/basedir-sp
 | Windows | 双击 **`启动.bat`**（中文提示，GBK 编码）；若控制台乱码改双击 `start.bat` |
 | macOS | 双击 **`start-macos.command`**（首次可能需右键 → 打开）；或在终端 `./start.sh` |
 | Linux | `./start.sh` |
-| 任意系统 | `npm install && npm start` |
+| 任意系统 | 装一次 **`hmcsm`** 命令（见下），以后任意目录敲 `hmcsm` 即可 |
+| 任意系统 | `npm install && npm start`（从源码直接跑） |
 | 装成后台服务（开机自启） | Windows `安装服务.bat`；Linux / macOS `./install-service.sh`（详见下方「注册成系统服务」） |
 
 脚本会检查 Node.js 版本（需要 **18+**）、依赖缺失时自动 `npm install`，启动后自动打开浏览器。
 没有 Node.js 时会直接提示安装地址，不会闪退。
+
+### 装一个 `hmcsm` 命令
+
+不想每次翻目录找 `启动.bat` 的话，装一次就好（**不需要管理员权限**）：
+
+```bash
+node scripts/install-cli.js install     # 装
+node scripts/install-cli.js status      # 看装在哪、PATH 里有没有
+node scripts/install-cli.js uninstall   # 卸
+```
+
+| 系统 | 装到哪 | PATH 怎么处理 |
+| --- | --- | --- |
+| Windows | `<配置目录>\bin\hmcsm.cmd` | 追加到**用户** PATH（改注册表 `HKCU:\Environment`，不用 `setx`，`%JAVA_HOME%\bin` 这类变量不会被展开写死，也不会被 1024 字符截断） |
+| Linux / macOS | `/usr/local/bin/hmcsm`（可写时）否则 `~/.local/bin/hmcsm` | 追加 `export PATH=...` 到 `~/.zshrc` 或 `~/.bashrc` |
+
+装完**新开一个终端**（旧窗口读的还是旧 PATH），之后：
+
+```bash
+hmcsm                     # 用已保存的端口和监听地址启动
+hmcsm --port 8720         # 临时换端口
+hmcsm --host 0.0.0.0      # 临时允许外部访问（前提是已经设了密码）
+```
+
+启动器优先用 PATH 里的 `node`，找不到才退回安装时记录的绝对路径 —— 以后换 Node 版本、用 nvm 切版本都不会失效。
+
+> 如果已经把 HMCS 注册成开机自启的服务，就不需要 `hmcsm` 了（服务在后台一直跑着），直接开浏览器访问即可。此时再敲 `hmcsm` 会提示端口被占用 —— 这是固定端口的正常行为。
 
 > Linux 发行版源里的 `nodejs` 常常太旧（Ubuntu 20.04 是 10.19）。没有 root 的话，把官方二进制解到
 > `~/opt` 再软链到 `~/.local/bin` 就行，不必装系统包；JDK 同理（`~/opt/jdk-21`，HMCS 会自动扫到）。
@@ -93,13 +121,31 @@ WebUI 端口是**固定**的，默认 `8720`。取值优先级：命令行 `--po
 
 退出码约定：`1` = 端口被占用（可重试），`2` = 配置错误（对外监听但没设密码、端口非法、端口 <1024 无权限）。服务脚本依赖这个区分，`systemd` 里配了 `RestartPreventExitStatus=2`，避免配置错了还无限重启。
 
+### 改完不用回命令行：页面里直接重启
+
+监听地址和端口都属于「下次启动生效」。设置页会**同时显示两个值**：
+
+- 下拉框里的是**已保存**的值（下次启动会用的）
+- 下面一行小字是**当前正在运行**的值
+
+两者不一致时，保存后会出现一条黄色提示 **「重启后生效」**，旁边是 **「立即重启」** 按钮：
+
+- 点了之后后端自己重启（不需要你去命令行重新跑）
+- 重启前会**先安全关闭正在运行的 Minecraft 服务端**（等它们写完存档），确认框里会列出来
+- 页面会轮询等新进程起来（比对 pid，避免把还没退干净的旧进程当成成功），然后自动刷新
+- 想反悔就点「撤销改动」，把配置改回当前运行中的值
+
+**重启失败的兜底**：新进程启动后如果 1.8 秒内就退出了（配置非法、Node 被删、端口被别人抢了），老进程会**放弃重启继续服务**，日志里记一条「重启中止」——不会出现「重启失败 = 面板彻底打不开」。此时页面会提示重启超时，去 `<数据目录>/logs/manager.log` 看原因。
+
+在服务模式下（systemd / 计划任务）：systemd 走 `Restart=always`，程序 exit(0) 后由 systemd 拉起；Windows 计划任务和 launchd 由程序自己拉起副本，参数原样继承（`--home`、`--log-file` 都在）。
+
 ## 远程访问与密码
 
 默认只听 `127.0.0.1`，只有本机能打开。要让它从别的机器访问：
 
 1. **先设密码**：设置 → 远程访问 → 设置密码（至少 8 位）
 2. **再改监听地址**：改成「所有网络（0.0.0.0）」
-3. 重启 HMCS（端口与地址都是启动参数，改完要重启）
+3. 点保存，页面出现黄条后点 **「立即重启」**（或自己重启 HMCS）
 
 顺序不能反。**监听非回环地址却没有密码时，程序拒绝启动**（退出码 2），因为管理面板能执行任意服务器指令、读写实例文件、删世界存档，裸奔到网络上等于把机器交出去。确实不需要密码的场景（受控内网）可以加 `--allow-insecure`。
 
@@ -148,6 +194,7 @@ node scripts/reset-password.js --clear      # 关掉密码访问
 5) 查看状态
 6) 卸载服务
 7) 打开管理界面
+8) 安装 hmcsm 命令到 PATH
 ```
 
 命令行等价写法：
@@ -163,6 +210,10 @@ node scripts/service.js install --dry-run  # 只打印将要写入的 unit / 计
 ```
 
 `sudo ./install-service.sh install` 会把服务装成系统级，但 **以调用 sudo 的那个用户身份运行**（脚本读 `SUDO_USER`），配置目录仍然落在你自己的家目录，不会凭空多出 `/root/.config/HMCS`。
+
+**端口和监听地址不在启动参数里**：安装时会把 `--port` / `--host` 写进 `settings.json`，`ExecStart` / 计划任务参数只留 `--log-file`（Windows 额外带 `--home`）。原因很实际 —— 命令行参数优先级高于配置文件，一旦写死，你在界面里改完设置、点了重启，还是会被告参数压回去，表现就是「设置保存了但永远不生效」。
+
+> **从 0.3.0 及更早版本升级上来**：旧的服务配置里写着 `--port` / `--host`，请**重新运行一次安装**（`安装服务.bat` 或 `./install-service.sh install`）让 unit / 计划任务换成新参数。重装会自动停掉旧实例、保留所有数据与实例。
 
 **停止是优雅的**：服务停止时不会直接 kill，而是先 `POST /api/system/shutdown`（用本机 `control.token` 鉴权），让 HMCS 依次给每个运行中的 Minecraft 发 `stop`、等它们把存档写完，再退出；systemd 的 `TimeoutStopSec=80` 和脚本里的 70 秒等待就是这个余量的来源。超时才强杀。
 
@@ -359,6 +410,8 @@ POST /api/fs/mkdir                      新建目录
 POST /api/reveal                        在资源管理器里打开路径
 GET  /api/clients                       探测本机客户端实例（只读建议）
 PUT  /api/settings                      保存设置（serversDir / clientRoots / extraWorldDirs / memory / javaPath / host / port）
+POST /api/system/restart                重启自己（改完端口 / 监听地址不用回命令行）
+POST /api/system/shutdown               优雅停止（服务脚本用）
 GET  /api/auth/state                    认证状态（免登录可读，用于登录页判断）
 POST /api/auth/login|logout             登录 / 退出（登录成功下发 HttpOnly 会话 Cookie）
 PUT  /api/auth/password                 设置 / 修改密码（已设置时必须带 current）
@@ -405,7 +458,8 @@ POST /api/system/shutdown               优雅关闭（停止全部服务端后�
 - YAML 树形编辑会丢注释（已有 `.hmcs.bak` 备份，也可切文本模式）
 - Modrinth 上部分插件未及时标注 26.3 兼容，搜索会自动放宽版本限制并列出可用版本，装前请核对
 - 端口映射依赖路由器 UPnP：网关关闭、双 NAT、CGNAT 时映射不生效（页面会给出对应提示）
-- WebUI 端口固定（默认 8720），被占用时直接报错退出、不会自动换端口；改端口要改 `settings.json` 或启动参数，并重启
+- WebUI 端口固定（默认 8720），被占用时直接报错退出、不会自动换端口；改端口/监听地址在设置页里改，保存后点「立即重启」即可生效（服务模式同样适用，因为这两个值不在服务启动参数里）
+- 「一键重启」在 systemd 下依赖 unit 里的 `Restart=always`；如果你是手工写的 unit，需要自己保证这一点，否则程序退出后就真停了
 - 内置服务是 **HTTP**，没有自带 TLS。经公网明文访问时密码在链路上可见，请套 HTTPS 反代或加密隧道
 - 「仅非本机免密」依赖连接的真实来源 IP；只有挂了反向代理时才该打开「信任反向代理头」，否则别人可以伪造来源绕过
 - Windows 的服务化用计划任务实现（SYSTEM 账户 + 开机启动），不是 SCM 注册的 `services.msc` 条目；关闭自启等于禁用该任务

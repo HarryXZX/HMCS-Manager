@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { URL } = require('url');
+const { spawn } = require('child_process');
 const yaml = require('js-yaml');
 
 // ------------------------------------------------------------------ 命令行参数
@@ -1108,6 +1109,23 @@ register('POST', '/api/system/shutdown', async (req, res) => {
   setTimeout(() => { gracefulShutdown('API 请求'); }, 120);
 });
 
+/**
+ * 一键重启：改完监听地址 / 端口后直接生效，不用回命令行。
+ * 返回时先给客户端一个明确的响应，再延后 150ms 才真的动手，
+ * 否则连接会在响应写完之前被 closeAllConnections 掐断，前端只能看到网络错误。
+ */
+register('POST', '/api/system/restart', async (req, res) => {
+  const stopping = proc.runningIds().length;
+  sendJson(res, 200, {
+    ok: true,
+    restarting: true,
+    stopping,
+    host: normalizeHost(readSettings().host),
+    port: Number(readSettings().port) || RUNTIME.port,
+  });
+  setTimeout(() => { restartSelf('API 请求（重启）'); }, 150);
+});
+
 
 // ---- 源 / Java / 设置
 register('GET', '/api/sources/versions', async (req, res, p, q) => {
@@ -1346,20 +1364,12 @@ function start() {
   // 提前把控制令牌写好：服务脚本要在任何请求之前就能拿到它来做优雅停止
   try { auth.controlToken(); } catch { /* 只读目录时退化为仅进程内有效 */ }
 
-  server.once('error', err => {
-    if (err.code === 'EADDRINUSE') {
-      portBusyHint(port);
-      process.exit(1);
-    }
-    if (err.code === 'EACCES') {
-      console.error(`没有权限监听端口 ${port}（1024 以下的端口需要 root / 管理员）`);
-      process.exit(2);
-    }
-    console.error('启动失败:', err.message);
-    process.exit(1);
-  });
+  // 「一键重启」时新进程会被立刻拉起，此时老进程可能还没释放端口。
+  // 只有带这个环境变量（即新进程由 restartSelf 拉起）才重试等端口，正常启动仍然是立刻报错。
+  const HANDOFF = process.env.HMCS_RESTART_HANDOFF === '1';
+  let listenTries = 0;
 
-  server.listen(port, host, () => {
+  const onListening = () => {
     const localOnly = isLoopbackHost(host);
     console.log('');
     console.log('HYCX MC Server Manager (HMCS) v' + pkg.version + ' 已启动');
@@ -1391,7 +1401,88 @@ function start() {
         selfmap.noteError(e.message);
       });
     }
-  });
+  };
+
+  const onListenError = err => {
+    if (err.code === 'EADDRINUSE' && HANDOFF && listenTries < 240) {
+      listenTries++;
+      if (listenTries === 1) console.log(`[HMCS] 等待上一个进程释放端口 ${port}…`);
+      setTimeout(() => {
+        server.once('error', onListenError);
+        try { server.listen(port, host, onListening); } catch { /* 下一轮再试 */ }
+      }, 250);
+      return;
+    }
+    if (err.code === 'EADDRINUSE') {
+      portBusyHint(port);
+      process.exit(1);
+    }
+    if (err.code === 'EACCES') {
+      console.error(`没有权限监听端口 ${port}（1024 以下的端口需要 root / 管理员）`);
+      process.exit(2);
+    }
+    console.error('启动失败:', err.message);
+    process.exit(1);
+  };
+
+  server.once('error', onListenError);
+  server.listen(port, host, onListening);
+}
+
+/**
+ * 重启自己（改完监听地址 / 端口后不用去命令行手动起）
+ *
+ * 两种托管方式分开处理：
+ *  - systemd（有 INVOCATION_ID）：直接退出，靠 unit 里的 Restart=always 拉起。
+ *    自己 spawn 的副本会被 systemd 的 KillMode 一起收走，反而起不来。
+ *  - 其它情况（手动运行 / Windows 计划任务 / launchd）：现场拉起一个自己的副本，
+ *    参数原样继承（--home / --log-file 必须带上，否则数据目录会跑偏），再从容退出。
+ */
+function restartSelf(reason) {
+  if (process.env.INVOCATION_ID) {
+    console.log('[HMCS] 重启：由 systemd 拉起新进程');
+    gracefulShutdown(reason, 0);
+    return { mode: 'systemd' };
+  }
+
+  let child;
+  try {
+    child = spawn(process.execPath, process.argv.slice(1), {
+      cwd: process.cwd(),
+      detached: true,
+      // 新进程的 stdout 不是 TTY，logger 会自动落盘到 <数据目录>/logs/manager.log
+      stdio: 'ignore',
+      windowsHide: true,
+      env: { ...process.env, HMCS_RESTART_HANDOFF: '1' },
+    });
+  } catch (e) {
+    console.error('[HMCS] 拉起新进程失败：' + e.message);
+    return { mode: 'failed', error: e.message };
+  }
+
+  const pid = child.pid || 0;
+  console.log('[HMCS] 已拉起新进程 pid=' + pid + '，端口释放后自动接管');
+
+  // 关键：不能拉起新进程就撒手不管。
+  // 新进程要是启动即崩（配置错误、Node 被删、端口被别的程序抢了），
+  // 老进程又已经退出，面板就彻底没了。这里等它 1.8 秒：
+  //   - 还活着（哪怕正在等端口）→ 自己退出，把端口让出去
+  //   - 已经挂了 → 什么都不做，继续用旧配置服务，错误在日志里
+  let dead = false;
+  const markDead = why => {
+    if (dead) return;
+    dead = true;
+    console.error('[HMCS] 重启中止：新进程没有活下来（' + why + '），继续用当前进程提供服务');
+  };
+  child.once('exit', (code, signal) => markDead(signal ? '信号 ' + signal : '退出码 ' + code));
+  child.once('error', e => markDead(e.message));
+  child.unref();
+
+  setTimeout(() => {
+    if (dead) return;
+    gracefulShutdown(reason, 0);
+  }, 1800).unref();
+  return { mode: 'spawn', pid };
 }
 
 start();

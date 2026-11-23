@@ -1353,10 +1353,15 @@ async function viewSettings(i) {
   const au = state.boot.auth || {};
   const net = state.boot.net || {};
   const su = net.selfUpnp || {};
-  const bindHost = (net.bind && net.bind.host) || '127.0.0.1';
-  const bindPort = (net.bind && net.bind.port) || s.port;
+  // 运行时值（真正在监听的）与目标值（settings.json 里保存的）必须分开：
+  // 界面要显示目标值，否则保存完一刷新就被运行时值盖回去，看起来像「设置没生效」。
+  const runHost = (net.bind && net.bind.host) || '127.0.0.1';
+  const runPort = (net.bind && net.bind.port) || s.port;
+  const wantHost = s.host || runHost;
+  const wantPort = Number(s.port) || runPort;
+  const pendingRestart = wantHost !== runHost || wantPort !== runPort;
   const urls = net.urls || [];
-  const lanOnly = bindHost === '127.0.0.1' || bindHost === '::1';
+  const lanOnly = runHost === '127.0.0.1' || runHost === '::1';
   const suAdded = (su.added || []).map(a => `${a.protocol} ${a.externalPort} → ${a.internalClient || '?'}:${a.internalPort}`).join('，');
 
   const securityHtml = `
@@ -1368,17 +1373,34 @@ async function viewSettings(i) {
         <div class="form-2">
           <div class="form-row"><label>监听地址</label>
             <select id="s-host">
-              <option value="127.0.0.1"${lanOnly ? ' selected' : ''}>仅本机（127.0.0.1）</option>
-              <option value="0.0.0.0"${lanOnly ? '' : ' selected'}>所有网络（0.0.0.0）</option>
+              <option value="127.0.0.1"${wantHost === '127.0.0.1' ? ' selected' : ''}>仅本机（127.0.0.1）</option>
+              <option value="0.0.0.0"${wantHost === '127.0.0.1' ? '' : ' selected'}>所有网络（0.0.0.0）</option>
             </select>
           </div>
           <div class="form-row"><label>固定端口</label>
-            <input id="s-port" type="number" min="1" max="65535" value="${esc(bindPort)}">
+            <input id="s-port" type="number" min="1" max="65535" value="${esc(wantPort)}">
           </div>
         </div>
-        <div class="tip">改完需要重启 HMCS 才生效。端口是固定的：被别的程序占用时直接报错退出，不会自动换一个端口。</div>
+        <div class="tip">端口是固定的：被别的程序占用时直接报错退出，不会自动换一个端口。<br>
+          当前运行：<span class="mono">${esc(runHost)}:${esc(runPort)}</span>${pendingRestart ? '　→ 已保存为 <span class="mono">' + esc(wantHost) + ':' + esc(wantPort) + '</span>' : ''}</div>
         <div class="tip" id="s-host-warn" style="color:#f0c674"></div>
       </div>
+
+      ${pendingRestart ? `
+      <div class="card" id="s-restart-bar" style="margin-top:12px;border-color:#5c451a;background:rgba(240,198,116,.10)">
+        <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+          <div style="flex:1;min-width:240px">
+            <div style="color:#f0c674;font-size:13.5px;font-weight:600">重启后生效</div>
+            <div class="tip">新配置已写入，正在运行的还是旧配置（<span class="mono">${esc(runHost)}:${esc(runPort)}</span>）。
+              点右边按钮重启 HMCS 本体，不需要回命令行。</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn sm ghost" id="s-restart-reset">撤销改动</button>
+            <button class="btn sm primary" id="s-restart">立即重启</button>
+          </div>
+        </div>
+        <div class="tip" id="s-restart-state" style="margin-top:8px"></div>
+      </div>` : ''}
 
       <div class="card" style="margin-top:12px">
         <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
@@ -1424,7 +1446,7 @@ async function viewSettings(i) {
         </div>
         <div class="form-2" style="margin-top:12px">
           <div class="form-row"><label>外网端口</label>
-            <input id="s-upnp-ext" type="number" min="1" max="65535" value="${su.externalPort || ''}" placeholder="${esc(bindPort)}"></div>
+            <input id="s-upnp-ext" type="number" min="1" max="65535" value="${su.externalPort || ''}" placeholder="${esc(wantPort)}"></div>
           <div class="form-row"><label>协议</label>
             <select id="s-upnp-proto">
               <option value="TCP"${su.protocol === 'UDP' ? '' : ' selected'}>TCP</option>
@@ -1650,6 +1672,53 @@ async function viewSettings(i) {
   };
   if (hostSel) { hostSel.onchange = hostWarn; hostWarn(); }
 
+  // ---- 一键重启（改完监听地址 / 端口就不用回命令行了）
+  const restartBtn = $('#s-restart');
+  if (restartBtn) restartBtn.onclick = async () => {
+    const runningInst = (state.boot.instances || []).filter(i => i.runtime && i.runtime.status !== 'stopped');
+    const names = runningInst.map(i => i.name).join('、');
+    const tip = runningInst.length
+      ? `重启会先安全关闭正在运行的 ${runningInst.length} 个服务端（${names}），等它们写完存档再退出。\n\n确定现在重启？`
+      : '重启期间页面会断开几秒，之后自动恢复。\n\n确定现在重启？';
+    if (!window.confirm(tip)) return;
+
+    const stateEl = $('#s-restart-state');
+    const oldText = restartBtn.textContent;
+    restartBtn.disabled = true;
+    restartBtn.textContent = '重启中…';
+    if (stateEl) stateEl.textContent = '正在通知 HMCS 关闭…';
+
+    let beforePid = 0;
+    try { beforePid = (await (await fetch('/api/system/ping', { cache: 'no-store' })).json()).pid || 0; } catch { /* ignore */ }
+
+    try { await api('/api/system/restart', { method: 'POST' }); }
+    catch { /* 进程退得比响应快时连接会断，这不是失败 */ }
+
+    if (stateEl) stateEl.textContent = '正在等待 HMCS 重新启动…';
+    const up = await waitForRestart(beforePid);
+    if (up) {
+      if (stateEl) stateEl.textContent = '已重启，正在刷新页面…';
+      setTimeout(() => location.reload(), 300);
+    } else {
+      restartBtn.disabled = false;
+      restartBtn.textContent = oldText;
+      if (stateEl) stateEl.textContent = '';
+      toast('重启超时：请查看日志，或手动运行 hmcsm 重新启动', 'err');
+    }
+  };
+
+  const resetBtn = $('#s-restart-reset');
+  if (resetBtn) resetBtn.onclick = async () => {
+    resetBtn.disabled = true;
+    try {
+      const r = await api('/api/settings', { method: 'PUT', body: { host: runHost, port: runPort } });
+      state.boot.settings = r.settings;
+      toast('已恢复成当前运行中的配置');
+      await refresh(true);
+      if (tpl === state.tab) await renderView();
+    } catch (e) { toast(e.message, 'err'); resetBtn.disabled = false; }
+  };
+
   const passBtn = $('#s-pass-set');
   if (passBtn) passBtn.onclick = () => openPasswordDialog();
 
@@ -1766,6 +1835,31 @@ async function viewSettings(i) {
       if (tpl === state.tab) await renderView();
     } catch (e) { toast(e.message, 'err'); btn.disabled = false; }
   };
+}
+
+/**
+ * 等 HMCS 重启回来再刷新页面。
+ *
+ * 判定「回来了」必须看 pid 变化：旧进程在关闭过程中 ping 可能还短暂可用，
+ * 只看 HTTP 200 会立刻当成功，刷新后看到的还是旧进程。
+ */
+function waitForRestart(prevPid, timeoutMs = 60000) {
+  const t0 = Date.now();
+  return new Promise(resolve => {
+    const tick = async () => {
+      if (Date.now() - t0 > timeoutMs) return resolve(false);
+      try {
+        const r = await fetch('/api/system/ping', { cache: 'no-store' });
+        if (r.ok) {
+          const d = await r.json();
+          if (d && d.ok && d.pid && d.pid !== prevPid) return resolve(true);
+        }
+      } catch { /* 端口还没起来 */ }
+      setTimeout(tick, 600);
+    };
+    // 先让旧进程有时间收连接，别一上来就探到旧实例
+    setTimeout(tick, 800);
+  });
 }
 
 /** 关闭密码保护前的身份确认 */
