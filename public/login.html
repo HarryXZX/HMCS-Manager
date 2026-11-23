@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>登录 · HMCS Manager</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233fb950'/%3E%3Cpath d='M9 22V10h3.2v4.6h6.6V10H22v12h-3.2v-4.6h-6.6V22z' fill='%23071409'/%3E%3C/svg%3E">
+<style>
+  :root{
+    color-scheme:dark;
+    --bg:#0b0f14; --panel:#121821; --line:#1e2a36; --text:#e6edf3; --muted:#8b98a5; --faint:#5d6b7a;
+    --accent:#3fb950; --danger:#f85149; --warn:#d29922;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;display:grid;place-items:center;padding:24px;
+    background:
+      radial-gradient(900px 420px at 50% -10%, rgba(63,185,80,.10), transparent 70%),
+      var(--bg);
+    color:var(--text);font:14px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+  }
+  .wrap{width:100%;max-width:372px}
+  .brand{display:flex;align-items:center;gap:10px;margin-bottom:22px}
+  .mark{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--accent),#1f8f4e);
+    display:grid;place-items:center;font-weight:700;color:#06120a;font-size:14px;letter-spacing:.5px}
+  .brand b{font-size:15px;letter-spacing:.3px;display:block}
+  .brand span{display:block;font-size:11px;color:var(--faint);letter-spacing:.4px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}
+  h1{margin:0 0 4px;font-size:15px;font-weight:600}
+  .sub{margin:0 0 16px;font-size:12.5px;color:var(--muted)}
+  label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+  input[type=password],input[type=text]{
+    width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line);
+    background:#0e141c;color:var(--text);font:inherit;outline:none;
+  }
+  input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(63,185,80,.14)}
+  button{
+    width:100%;margin-top:14px;padding:10px 12px;border-radius:9px;border:1px solid #1f6f36;
+    background:var(--accent);color:#06120a;font:inherit;font-weight:600;cursor:pointer;
+  }
+  button:hover{filter:brightness(1.06)}
+  button:disabled{opacity:.6;cursor:not-allowed;filter:none}
+  .msg{margin-top:12px;font-size:12.5px;min-height:18px;line-height:1.5}
+  .msg.err{color:var(--danger)}
+  .msg.warn{color:var(--warn)}
+  .msg.ok{color:var(--accent)}
+  .foot{margin-top:14px;font-size:11.5px;color:var(--faint);text-align:center;line-height:1.7}
+  .hint{margin-top:10px;font-size:11.5px;color:var(--faint);line-height:1.6}
+  .mono{font-family:Consolas,"Cascadia Mono",monospace}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <div class="mark">HY</div>
+    <div>
+      <b>HMCS Manager</b>
+      <span>Minecraft 服务端管理器</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h1>需要访问密码</h1>
+    <p class="sub" id="sub">这台 HMCS 已开启密码访问，请输入密码继续。</p>
+    <form id="form" autocomplete="off">
+      <label for="pw">访问密码</label>
+      <input id="pw" type="password" name="password" autocomplete="current-password" autofocus required>
+      <button id="go" type="submit">进入管理面板</button>
+    </form>
+    <div class="msg" id="msg"></div>
+    <div class="hint" id="hint"></div>
+  </div>
+
+  <div class="foot">
+    连续输错会被临时锁定；忘记密码时，在本机运行<br>
+    <span class="mono">node scripts/reset-password.js</span> 重置
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = s => document.querySelector(s);
+const msg = $('#msg');
+const go = $('#go');
+const pw = $('#pw');
+
+const next = (() => {
+  const q = new URLSearchParams(location.search);
+  const n = q.get('next') || '';
+  // 只接受本站相对路径，避免被诱导跳到外部站点
+  return n.startsWith('/') && !n.startsWith('//') ? n : '/';
+})();
+
+function say(text, kind = '') {
+  msg.className = 'msg' + (kind ? ' ' + kind : '');
+  msg.textContent = text || '';
+}
+
+let lockedUntil = 0;
+let lockTimer = null;
+function startLock(sec, reason) {
+  lockedUntil = Date.now() + sec * 1000;
+  go.disabled = true;
+  const tick = () => {
+    const left = Math.ceil((lockedUntil - Date.now()) / 1000);
+    if (left <= 0) {
+      clearInterval(lockTimer); lockTimer = null;
+      go.disabled = false; go.textContent = '进入管理面板';
+      say(reason || '可以重试了', 'warn');
+      return;
+    }
+    go.textContent = `请等待 ${left} 秒`;
+    say((reason ? reason + ' · ' : '') + `剩余 ${left} 秒`, 'warn');
+  };
+  tick();
+  lockTimer = setInterval(tick, 1000);
+}
+
+async function post(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  let data = {};
+  try { data = await res.json(); } catch { /* 后端异常时保持空对象 */ }
+  return { res, data };
+}
+
+(async function init() {
+  try {
+    const r = await fetch('/api/auth/state', { headers: { Accept: 'application/json' } });
+    const st = await r.json();
+    if (!st.enabled || st.authed) { location.replace(next); return; }
+    if (st.onlyRemote === false) $('#sub').textContent = '这台 HMCS 已开启密码访问，请输入密码继续。';
+    else $('#sub').textContent = '来自 ' + (st.ip || '外部') + ' 的访问需要密码。本机访问可免密。';
+    if (!st.passwordSet) {
+      say('尚未设置密码，请在本机打开管理面板设置', 'err');
+      go.disabled = true;
+    }
+  } catch {
+    say('无法连接后端，请确认 HMCS 正在运行', 'err');
+  }
+})();
+
+$('#form').addEventListener('submit', async e => {
+  e.preventDefault();
+  if (lockTimer) return;
+  const value = pw.value;
+  if (!value) { say('请输入密码', 'err'); return; }
+  go.disabled = true; go.textContent = '验证中…';
+  say('');
+  try {
+    const { res, data } = await post('/api/auth/login', { password: value });
+    if (res.ok && data.ok) {
+      go.textContent = '进入中…';
+      say('验证通过', 'ok');
+      location.replace(next);
+      return;
+    }
+    pw.value = ''; pw.focus();
+    if (res.status === 429 && data.retryAfter) {
+      startLock(Number(data.retryAfter), data.error);
+      return;
+    }
+    const left = data.attemptsLeft;
+    say((data.error || '密码错误') + (left !== undefined && left > 0 ? `（还剩 ${left} 次机会）` : ''), 'err');
+    go.disabled = false; go.textContent = '进入管理面板';
+  } catch (err) {
+    say('请求失败：' + err.message, 'err');
+    go.disabled = false; go.textContent = '进入管理面板';
+  }
+});
+</script>
+</body>
+</html>

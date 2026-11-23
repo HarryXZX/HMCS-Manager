@@ -53,7 +53,14 @@ const sandbox = {
     removeItem: k => store.delete(k),
   },
   navigator: { clipboard: { writeText: async () => {} } },
-  location: { search: '?tab=' + (process.env.SMOKE_TAB || 'overview'), href: BASE + '/' },
+  location: {
+    search: '?tab=' + (process.env.SMOKE_TAB || 'overview') +
+      (process.env.SMOKE_INST ? '&inst=' + encodeURIComponent(process.env.SMOKE_INST) : ''),
+    href: BASE + '/',
+    // 登录态失效时 app.js 会 location.replace 到登录页，桩里得接住
+    replace(u) { this.href = u; },
+    assign(u) { this.href = u; },
+  },
   document: {
     querySelector: sel,
     querySelectorAll: () => [],

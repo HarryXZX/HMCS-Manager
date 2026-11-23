@@ -29,6 +29,12 @@ async function api(path, opts = {}) {
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); } catch { data = { error: text || ('HTTP ' + res.status) }; }
+  // 会话过期或被踢下线：直接送去登录页，别让用户对着一堆「需要登录」的红字
+  if (res.status === 401 && data.authRequired) {
+    const next = location.pathname + location.search;
+    location.replace('/login?next=' + encodeURIComponent(next));
+    throw new Error('需要登录');
+  }
   if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   return data;
 }
@@ -1343,6 +1349,97 @@ async function viewSettings(i) {
   const infoMap = new Map();
   for (const c of (state.boot.clientInfo || [])) infoMap.set(c.path.toLowerCase(), c);
 
+  // ---- 远程访问 / 安全卡片
+  const au = state.boot.auth || {};
+  const net = state.boot.net || {};
+  const su = net.selfUpnp || {};
+  const bindHost = (net.bind && net.bind.host) || '127.0.0.1';
+  const bindPort = (net.bind && net.bind.port) || s.port;
+  const urls = net.urls || [];
+  const lanOnly = bindHost === '127.0.0.1' || bindHost === '::1';
+  const suAdded = (su.added || []).map(a => `${a.protocol} ${a.externalPort} → ${a.internalClient || '?'}:${a.internalPort}`).join('，');
+
+  const securityHtml = `
+    <div class="section" style="max-width:860px">
+      <div class="section-head"><h2>远程访问</h2>
+        <div class="desc">默认只听本机；对外开放必须先设密码</div></div>
+
+      <div class="card">
+        <div class="form-2">
+          <div class="form-row"><label>监听地址</label>
+            <select id="s-host">
+              <option value="127.0.0.1"${lanOnly ? ' selected' : ''}>仅本机（127.0.0.1）</option>
+              <option value="0.0.0.0"${lanOnly ? '' : ' selected'}>所有网络（0.0.0.0）</option>
+            </select>
+          </div>
+          <div class="form-row"><label>固定端口</label>
+            <input id="s-port" type="number" min="1" max="65535" value="${esc(bindPort)}">
+          </div>
+        </div>
+        <div class="tip">改完需要重启 HMCS 才生效。端口是固定的：被别的程序占用时直接报错退出，不会自动换一个端口。</div>
+        <div class="tip" id="s-host-warn" style="color:#f0c674"></div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
+          <div style="flex:1;min-width:220px">
+            <div style="font-size:13px;display:flex;align-items:center;gap:8px">
+              访问密码
+              ${au.enabled ? '<span class="tag" style="color:#7ee2a8;border-color:#1f5f3a">已启用</span>'
+                : (au.passwordSet ? '<span class="tag" style="color:#f0c674;border-color:#5c451a">已设置但未启用</span>'
+                  : '<span class="tag" style="color:#f0c674;border-color:#5c451a">未设置</span>')}
+            </div>
+            <div class="tip">密码以 scrypt 加盐哈希保存，不存明文；连续输错会按 IP 指数退避锁定。
+              经公网明文 HTTP 访问时密码在链路上是可见的，建议配合 HTTPS 反代或加密隧道。</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn sm primary" id="s-pass-set">${au.passwordSet ? '修改密码' : '设置密码'}</button>
+            ${au.passwordSet ? '<button class="btn sm ghost" id="s-logout">退出登录</button>' : ''}
+          </div>
+        </div>
+
+        <div style="margin-top:14px;display:grid;gap:10px">
+          ${au.passwordSet ? `<label class="switch"><input type="checkbox" id="s-authenabled"${au.enabled ? ' checked' : ''}> 启用密码访问</label>` : ''}
+          <label class="switch"><input type="checkbox" id="s-onlyremote"${au.onlyRemote ? ' checked' : ''}> 仅非本机访问需要密码（本机 127.0.0.1 免密）</label>
+          <label class="switch"><input type="checkbox" id="s-trustproxy"${au.trustProxy ? ' checked' : ''}> 信任反向代理头（X-Forwarded-For / -Proto）</label>
+          <div class="tip" style="margin-top:-6px">直连时别开这一项，否则别人能伪造来源 IP 绕过「仅远程需要密码」。挂在 Nginx / Caddy 后面才开。</div>
+        </div>
+
+        <div class="form-row" style="margin:14px 0 0"><label>登录保持天数</label>
+          <input id="s-sess" type="number" min="1" max="90" value="${esc(au.sessionDays || 7)}">
+          <div class="tip">改密码会让所有已登录的浏览器立即失效。</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
+          <div style="flex:1;min-width:220px">
+            <div style="font-size:13px">端口映射（UPnP）</div>
+            <div class="tip">让路由器把外网端口转到这个管理界面的端口。需要路由器开启 UPnP，且监听地址不是「仅本机」。</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn sm ghost" id="s-upnp-now">立即映射</button>
+            <button class="btn sm ghost" id="s-upnp-off"${suAdded ? '' : ' disabled'}>取消映射</button>
+          </div>
+        </div>
+        <div class="form-2" style="margin-top:12px">
+          <div class="form-row"><label>外网端口</label>
+            <input id="s-upnp-ext" type="number" min="1" max="65535" value="${su.externalPort || ''}" placeholder="${esc(bindPort)}"></div>
+          <div class="form-row"><label>协议</label>
+            <select id="s-upnp-proto">
+              <option value="TCP"${su.protocol === 'UDP' ? '' : ' selected'}>TCP</option>
+              <option value="UDP"${su.protocol === 'UDP' ? ' selected' : ''}>UDP</option>
+            </select></div>
+        </div>
+        <label class="switch"><input type="checkbox" id="s-upnp-auto"${su.auto ? ' checked' : ''}> 启动时自动映射</label>
+        <div class="tip" id="s-upnp-state" style="margin-top:10px">
+          ${suAdded ? '当前映射：' + esc(suAdded) : '当前没有由 HMCS 建立的映射'}
+          ${su.lastError ? '<br><span style="color:#ff9a94">上次失败：' + esc(su.lastError) + '</span>' : ''}
+        </div>
+        <div class="tip" id="s-net-urls">${urls.length ? '可访问地址：' + urls.map(u => `<span class="mono">${esc(u)}</span>`).join('　') : ''}</div>
+      </div>
+    </div>`;
+
   $('#view').innerHTML = `
     <div class="section" style="max-width:860px">
       <div class="section-head"><h2>存储位置</h2><div class="desc">配置全部放在系统用户目录，程序目录只留代码</div></div>
@@ -1406,25 +1503,26 @@ async function viewSettings(i) {
         </div>
         <div class="form-row"><label>默认内存上限（-Xmx）</label><input id="s-mem" value="${esc(s.memory || '2G')}">
           <div class="tip">例如 2G / 4G；新建实例时的默认值</div></div>
-        <div class="form-row"><label>WebUI 端口</label><input id="s-port" type="number" value="${s.port}" disabled>
-          <div class="tip">修改后需重启 HMCS 生效（改配置目录里的 settings.json）</div></div>
       </div>
     </div>
+
+    ${securityHtml}
 
     <div class="section" style="max-width:860px">
       <div class="section-head"><h2>关于</h2></div>
       <div class="card">
         <div class="mono" style="font-size:12.5px;line-height:1.9">
-          HMCS · 本地 Minecraft 服务端管理器<br>
+          HMCS · 本地 Minecraft 服务端管理器 v${esc(state.boot.version || '')}<br>
           核心来源：Mojang 官方 / PaperMC(fill v3) / Purpur / Fabric Meta<br>
           插件来源：Modrinth<br>
-          服务只监听 127.0.0.1，不对外网开放
+          监听：${esc(net.bind ? net.bind.host + ':' + net.bind.port : '')}${net.bind && net.bind.localOnly ? '（仅本机）' : '（已对外开放，需密码）'}<br>
+          访问地址：${(net.urls || []).map(u => esc(u)).join('  ') || '—'}
         </div>
       </div>
     </div>
 
     <div class="save-bar" style="max-width:860px">
-      <span class="faint" style="font-size:12px">目录列表的增删即时生效；实例目录、Java、内存改动需点保存</span>
+      <span class="faint" style="font-size:12px">目录列表的增删即时生效；实例目录、Java、内存、监听地址与端口改动需点保存</span>
       <button class="btn primary" id="s-save">保存设置</button>
     </div>`;
 
@@ -1539,6 +1637,112 @@ async function viewSettings(i) {
     };
   };
 
+  // ---- 远程访问 / 安全
+  const hostSel = $('#s-host');
+  const hostWarn = () => {
+    const el = $('#s-host-warn');
+    if (!el) return;
+    if (!hostSel || hostSel.value === '127.0.0.1') { el.textContent = ''; return; }
+    const a = state.boot.auth || {};
+    el.textContent = a.enabled
+      ? '保存并重启后，局域网 / 外网就能访问这个面板了；非本机访问必须输入密码。'
+      : '还没有设置密码。后端会拒绝这个配置——先在下面点「设置密码」。';
+  };
+  if (hostSel) { hostSel.onchange = hostWarn; hostWarn(); }
+
+  const passBtn = $('#s-pass-set');
+  if (passBtn) passBtn.onclick = () => openPasswordDialog();
+
+  const logoutBtn = $('#s-logout');
+  if (logoutBtn) logoutBtn.onclick = async () => {
+    try { await api('/api/auth/logout', { method: 'POST' }); } catch { /* 已经掉线也算成功 */ }
+    location.href = '/login';
+  };
+
+  const authOpt = async (body, msg) => {
+    try {
+      const r = await api('/api/auth/options', { method: 'PUT', body });
+      state.boot.auth = { ...(state.boot.auth || {}), ...r.auth };
+      toast(msg || '已更新');
+      if (tpl === state.tab) await renderView();
+    } catch (e) {
+      toast(e.message, 'err');
+      if (tpl === state.tab) await renderView();
+    }
+  };
+
+  const authEl = $('#s-authenabled');
+  if (authEl) authEl.onchange = async () => {
+    if (authEl.checked) return authOpt({ enabled: true }, '密码访问已启用');
+    const cur = await askPassword('关闭密码访问');
+    if (cur === null) { authEl.checked = true; return; }
+    authOpt({ enabled: false, current: cur }, '密码访问已关闭');
+  };
+
+  const onlyRemoteEl = $('#s-onlyremote');
+  if (onlyRemoteEl) onlyRemoteEl.onchange = () => authOpt({ onlyRemote: onlyRemoteEl.checked });
+
+  const trustProxyEl = $('#s-trustproxy');
+  if (trustProxyEl) trustProxyEl.onchange = () => authOpt({ trustProxy: trustProxyEl.checked });
+
+  const sessEl = $('#s-sess');
+  if (sessEl) sessEl.onchange = () => authOpt({ sessionDays: Number(sessEl.value) });
+
+  const upnpAuto = $('#s-upnp-auto');
+  if (upnpAuto) upnpAuto.onchange = async () => {
+    try {
+      const r = await api('/api/net/self', {
+        method: 'PUT',
+        body: {
+          auto: upnpAuto.checked,
+          externalPort: Number($('#s-upnp-ext').value) || 0,
+          protocol: $('#s-upnp-proto').value,
+        },
+      });
+      state.boot.net.selfUpnp = r.self;
+      toast(upnpAuto.checked ? '已开启：启动时自动映射本机端口' : '已关闭自动映射');
+      if (tpl === state.tab) await renderView();
+    } catch (e) {
+      toast(e.message, 'err');
+      upnpAuto.checked = !upnpAuto.checked;
+    }
+  };
+
+  const mapNow = $('#s-upnp-now');
+  if (mapNow) mapNow.onclick = async () => {
+    const old = mapNow.textContent;
+    mapNow.disabled = true; mapNow.textContent = '映射中…';
+    try {
+      const r = await api('/api/net/selfmap', {
+        method: 'POST',
+        body: {
+          externalPort: Number($('#s-upnp-ext').value) || 0,
+          protocol: $('#s-upnp-proto').value,
+        },
+      });
+      toast(r.externalUrl ? '映射成功：' + r.externalUrl : '映射成功');
+      await refresh(true);
+      if (tpl === state.tab) await renderView();
+    } catch (e) {
+      toast(e.message, 'err');
+      mapNow.disabled = false; mapNow.textContent = old;
+    }
+  };
+
+  const unmapBtn = $('#s-upnp-off');
+  if (unmapBtn) unmapBtn.onclick = async () => {
+    unmapBtn.disabled = true;
+    try {
+      await api('/api/net/unmap', { method: 'POST' });
+      toast('已取消映射');
+      await refresh(true);
+      if (tpl === state.tab) await renderView();
+    } catch (e) {
+      toast(e.message, 'err');
+      unmapBtn.disabled = false;
+    }
+  };
+
   $('#s-save').onclick = async () => {
     const btn = $('#s-save');
     btn.disabled = true;
@@ -1551,13 +1755,68 @@ async function viewSettings(i) {
           serversDir: $('#s-sdir').value.trim() || serversDir,
           clientRoots,
           extraWorldDirs: extraDirs,
+          host: hostSel ? hostSel.value : undefined,
+          port: $('#s-port') ? Number($('#s-port').value) : undefined,
         },
       });
       state.boot.settings = r.settings;
-      toast('设置已保存');
+      if (r.restartRequired) toast('已保存：端口 / 监听地址改动需要重启 HMCS 才生效', 'warn');
+      else toast('设置已保存');
       await refresh(true);
       if (tpl === state.tab) await renderView();
     } catch (e) { toast(e.message, 'err'); btn.disabled = false; }
+  };
+}
+
+/** 关闭密码保护前的身份确认 */
+function askPassword(title) {
+  return new Promise(resolve => {
+    const m = modal({
+      title,
+      body: `<div class="form-row"><label>当前密码</label>
+          <input id="ap-cur" type="password" autocomplete="current-password"></div>
+        <div class="tip">关闭防护属于降级操作，需要再确认一次是本人操作。</div>`,
+      foot: '<button class="btn" data-cancel>取消</button><button class="btn danger" data-ok>确认关闭</button>',
+    });
+    const input = $('#ap-cur', m.root);
+    input.focus();
+    const done = v => { m.close(); resolve(v); };
+    $('[data-cancel]', m.root).onclick = () => done(null);
+    $('[data-ok]', m.root).onclick = () => done(input.value);
+    input.onkeydown = e => { if (e.key === 'Enter') done(input.value); };
+  });
+}
+
+/** 设置 / 修改访问密码 */
+function openPasswordDialog() {
+  const au = state.boot.auth || {};
+  const m = modal({
+    title: au.passwordSet ? '修改访问密码' : '设置访问密码',
+    body: `
+      ${au.passwordSet ? `<div class="form-row"><label>当前密码</label>
+        <input id="pw-cur" type="password" autocomplete="current-password"></div>` : ''}
+      <div class="form-row"><label>新密码</label>
+        <input id="pw-new" type="password" autocomplete="new-password">
+        <div class="tip">至少 8 位；别用 12345678、password 这类。</div></div>
+      <div class="form-row"><label>再输一次</label>
+        <input id="pw-new2" type="password" autocomplete="new-password"></div>
+      <div class="tip">保存后，非本机访问（或你选择的策略下所有访问）都要输入这个密码。
+        忘记密码可在本机运行 <span class="mono">node scripts/reset-password.js</span>。</div>`,
+    foot: '<button class="btn" data-close>取消</button><button class="btn primary" id="pw-ok">保存</button>',
+  });
+  ($('#pw-cur', m.root) || $('#pw-new', m.root)).focus();
+  $('#pw-ok', m.root).onclick = async () => {
+    const cur = $('#pw-cur', m.root) ? $('#pw-cur', m.root).value : '';
+    const a = $('#pw-new', m.root).value;
+    const b = $('#pw-new2', m.root).value;
+    if (a !== b) { toast('两次输入不一致', 'err'); return; }
+    try {
+      await api('/api/auth/password', { method: 'PUT', body: { current: cur, password: a } });
+      m.close();
+      toast('密码已保存');
+      await refresh(true);
+      if (state.tab === 'settings') await renderView();
+    } catch (e) { toast(e.message, 'err'); }
   };
 }
 

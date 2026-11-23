@@ -5,7 +5,9 @@
 仓库：<https://github.com/HarryXZX/HMCS-Manager>
 
 纯 **Node.js + 原生 JavaScript** 实现：后端无框架（原生 `http` 路由），前端原生 JS/CSS，**无构建步骤、无数据库**。
-WebUI 只监听 `127.0.0.1`，不对外网开放；对外只暴露你显式映射的那一个游戏端口。
+
+默认只监听 `127.0.0.1`。需要从别的机器管理时，把监听地址改成 `0.0.0.0` 并**先设访问密码**（scrypt 加盐哈希 + 会话 Cookie + 登录限流），
+再让 HMCS 用 UPnP 把自己的端口映射出去即可；也可以一键注册成 Windows 计划任务 / systemd / launchd 服务，开机自启、无窗口运行。
 
 支持 **Windows / macOS / Linux**。
 
@@ -13,14 +15,18 @@ WebUI 只监听 `127.0.0.1`，不对外网开放；对外只暴露你显式映�
 
 ```
 <程序目录>                      ← 只有代码，可以随意移动 / 重新下载
-  app.js              入口（HTTP 服务 + 全部 API）
+  app.js              入口（HTTP 服务 + 全部 API + 认证闸门）
   lib/                sources（核心源）/ instances（实例注册表）/ fsbrowse（目录浏览）
                       proc（进程托管）/ worlds（存档）/ props / eula / upnp
-  public/             前端（原生 JS，无构建）
-  _dev/               自测脚本（模拟 UPnP 网关、前端冒烟测试），可整个删除
+                      auth（密码/会话/限流）/ selfmap（自身端口映射）/ logger（日志落盘）
+  public/             前端（原生 JS，无构建）；login.html 是独立的登录页
+  scripts/            service.js（服务注册与管理）/ reset-password.js（重置密码）
+  _dev/               自测脚本（模拟 UPnP 网关、认证用例、前端冒烟测试），可整个删除
   启动.bat            Windows 中文版（GBK 编码）
   start.bat           Windows 英文版（控制台无中文时用）
+  安装服务.bat        Windows：注册 / 起停 / 自启 / 卸载（会请求管理员权限）
   start.sh            Linux / macOS
+  install-service.sh  Linux / macOS：注册 / 起停 / 自启 / 卸载
   start-macos.command macOS 双击启动
 ```
 
@@ -35,10 +41,16 @@ WebUI 只监听 `127.0.0.1`，不对外网开放；对外只暴露你显式映�
 Linux 按 [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/) 规范把配置与实例数据分开：配置小、值得备份；`servers/` 常是几十 GB 存档，归到 data 目录才不会被备份 / 同步工具当成配置一起搬。
 
 ```
-  settings.json     应用设置（实例目录、客户端根目录、Java、内存）
+  settings.json     应用设置（实例目录、客户端根目录、Java、内存、监听地址、认证参数）
   instances.json    实例注册表（记录每个实例的真实磁盘路径）
+  sessions.json     会话表（只存令牌的 SHA-256，不存可用 Cookie）
+  control.token     本机运维凭据（服务脚本用来优雅停止，0600）
+  service.json      服务注册时写死的启动参数（端口 / 地址 / 后端类型）
   servers/          默认实例存放目录（可在设置里改成任意位置）
+  logs/             运行日志（仅 Linux 在 data 目录；Windows / macOS 与配置同目录）
 ```
+
+`settings.json`、`sessions.json`、`control.token` 在 POSIX 上以 `0600` 创建。
 
 环境变量 `HMCS_HOME` 可以把两者统一指到一个自定义目录（旧名 `HYSERV_HOME` 仍然兼容）。
 
@@ -50,6 +62,7 @@ Linux 按 [XDG Base Directory](https://specifications.freedesktop.org/basedir-sp
 | macOS | 双击 **`start-macos.command`**（首次可能需右键 → 打开）；或在终端 `./start.sh` |
 | Linux | `./start.sh` |
 | 任意系统 | `npm install && npm start` |
+| 装成后台服务（开机自启） | Windows `安装服务.bat`；Linux / macOS `./install-service.sh`（详见下方「注册成系统服务」） |
 
 脚本会检查 Node.js 版本（需要 **18+**）、依赖缺失时自动 `npm install`，启动后自动打开浏览器。
 没有 Node.js 时会直接提示安装地址，不会闪退。
@@ -65,6 +78,97 @@ Linux 按 [XDG Base Directory](https://specifications.freedesktop.org/basedir-sp
 4. 切到 **控制台** 看实时日志、发命令；**文件** 页可上传/下载/改名/在线编辑；**配置** 页可视化改 `server.properties` 与 YAML/JSON
 5. **插件** 页搜 Modrinth 直接装；**世界** 页可随时把别的存档链接进来或断开链接
 6. **网络** 页检测 UPnP 网关并一键开端口，可设成「随服务端启停自动映射」
+
+## 端口：固定，不漂移
+
+WebUI 端口是**固定**的，默认 `8720`。取值优先级：命令行 `--port` > 环境变量 `HMCS_PORT` > `settings.json` 的 `port`。
+
+端口被别的程序占用时，HMCS 会直接报错退出，**不会偷偷 +1 换个端口**——因为这个地址可能已经写进了服务配置、书签、端口映射里，静默漂移只会让人找不到界面。
+
+```
+端口 8720 已被其他程序占用。HMCS 使用固定端口，不会自动换端口。
+  查占用进程：netstat -ano | findstr :8720   然后 taskkill /PID <PID> /F
+  或者换个端口启动：node app.js --port 8721（同时要改 settings.json 或服务配置）
+```
+
+退出码约定：`1` = 端口被占用（可重试），`2` = 配置错误（对外监听但没设密码、端口非法、端口 <1024 无权限）。服务脚本依赖这个区分，`systemd` 里配了 `RestartPreventExitStatus=2`，避免配置错了还无限重启。
+
+## 远程访问与密码
+
+默认只听 `127.0.0.1`，只有本机能打开。要让它从别的机器访问：
+
+1. **先设密码**：设置 → 远程访问 → 设置密码（至少 8 位）
+2. **再改监听地址**：改成「所有网络（0.0.0.0）」
+3. 重启 HMCS（端口与地址都是启动参数，改完要重启）
+
+顺序不能反。**监听非回环地址却没有密码时，程序拒绝启动**（退出码 2），因为管理面板能执行任意服务器指令、读写实例文件、删世界存档，裸奔到网络上等于把机器交出去。确实不需要密码的场景（受控内网）可以加 `--allow-insecure`。
+
+| 机制 | 实现 |
+| --- | --- |
+| 密码存储 | `scrypt(N=16384, r=8, p=1)` + 16 字节随机盐，存 `scrypt$N$r$p$salt$hash`；比对走 `timingSafeEqual` |
+| 会话 | 32 字节随机令牌进 Cookie（`HttpOnly; SameSite=Lax`，HTTPS 下自动加 `Secure`）；`sessions.json` 只存 SHA-256 |
+| 改密码 | 旧会话立即全部失效，同时给当前浏览器换发新会话，不会把自己踢出去 |
+| 登录限流 | 同一 IP 连续 5 次失败后指数退避：60 秒起，翻倍，上限 30 分钟；返回 `Retry-After` |
+| 跨站防护 | 写操作校验 `Origin` 与 `Host` 是否一致 + `SameSite=Lax` |
+| 响应头 | `X-Frame-Options: DENY`（防点击劫持）、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer` |
+| 本机免密 | 「仅非本机访问需要密码」默认开启；本机 `127.0.0.1` 直连不用登录，方便你在服务器本机操作 |
+
+**忘了密码**：本机执行
+
+```bash
+node scripts/reset-password.js              # 交互式设置新密码
+node scripts/reset-password.js --clear      # 关掉密码访问
+```
+
+**关于 HTTPS**：内置服务是明文 HTTP，经公网直接访问时密码在链路上可见。正经做法是套一层 Nginx / Caddy 做 TLS 反代（或用内网穿透自带的加密隧道），反代后把「信任反向代理头」打开，并把监听地址改回 `127.0.0.1` —— 反代和 HMCS 在同一台机器时这是最安全的组合。
+
+### 自动端口映射（UPnP）
+
+设置里可以打开「启动时自动映射」：HMCS 启动后用 UPnP 把自己的 WebUI 端口登记到路由器，退出时回收。外网端口可以填别的（比如外网 8721 → 内网 8720）。
+
+- 只有在监听地址不是「仅本机」时才允许开启，否则映射建好了也没人应答
+- 和「网络」页给游戏端口做映射用的是同一套 `lib/upnp.js`，同样受 CGNAT 限制
+- 映射成功会在日志里打印 `外部访问地址 http://<公网IP>:<端口>`
+
+## 注册成系统服务
+
+三个平台都有一键脚本，交互菜单与命令行两种用法：
+
+| 系统 | 入口 | 实现 |
+| --- | --- | --- |
+| Windows | `安装服务.bat` | 计划任务 `HMCS`：`/SC ONSTART` + `/RU SYSTEM` + `/RL HIGHEST`，开机即起、无窗口、不依赖登录 |
+| Linux | `./install-service.sh` | systemd：root 装系统级（`User=<你>`），非 root 自动装用户级 + `enable-linger` |
+| macOS | `./install-service.sh` | launchd `~/Library/LaunchAgents/com.hycx.hmcs.plist`，`RunAtLoad` 控制自启 |
+
+```
+1) 安装 / 重装服务
+2) 启动服务
+3) 停止服务
+4) 开机自启  开 / 关
+5) 查看状态
+6) 卸载服务
+7) 打开管理界面
+```
+
+命令行等价写法：
+
+```bash
+node scripts/service.js install            # 注册并启动（默认开启自启）
+node scripts/service.js install --port 8720 --host 0.0.0.0 --no-autostart
+node scripts/service.js start | stop | restart
+node scripts/service.js enable | disable   # 只切开机自启
+node scripts/service.js status             # 状态 + 版本 + 已运行时长 + 访问地址
+node scripts/service.js uninstall          # 卸载（保留数据与实例）
+node scripts/service.js install --dry-run  # 只打印将要写入的 unit / 计划任务参数
+```
+
+`sudo ./install-service.sh install` 会把服务装成系统级，但 **以调用 sudo 的那个用户身份运行**（脚本读 `SUDO_USER`），配置目录仍然落在你自己的家目录，不会凭空多出 `/root/.config/HMCS`。
+
+**停止是优雅的**：服务停止时不会直接 kill，而是先 `POST /api/system/shutdown`（用本机 `control.token` 鉴权），让 HMCS 依次给每个运行中的 Minecraft 发 `stop`、等它们把存档写完，再退出；systemd 的 `TimeoutStopSec=80` 和脚本里的 70 秒等待就是这个余量的来源。超时才强杀。
+
+**Windows 的取舍**：Windows 没有免依赖的真·服务宿主（写 SCM 需要原生模块，NSSM / WinSW 要额外下载二进制）。这里用「计划任务 + SYSTEM」达到等价效果。因为 SYSTEM 的 `%APPDATA%` 和你的不同，脚本会用 `--home` 把数据目录钉死成安装者的配置目录，所以实例列表不会跑到 `C:\Windows\system32\config\systemprofile` 下面去。注意「关闭开机自启」在 Windows 上等于禁用该任务，此时手工 `start` 会临时启用、启动后自动恢复禁用。
+
+**日志**：服务模式没有控制台，`console` 输出会自动写进 `<数据目录>/logs/manager.log`（5 MB 滚动、留 3 份，权限 0600）。Linux 上同时能用 `journalctl --user -u hmcs -f`（系统级则去掉 `--user`）看。
 
 ## 存储位置：目录都能自己选
 
@@ -254,8 +358,21 @@ GET  /api/fs/browse?path=               列子目录（目录选择器用）
 POST /api/fs/mkdir                      新建目录
 POST /api/reveal                        在资源管理器里打开路径
 GET  /api/clients                       探测本机客户端实例（只读建议）
-PUT  /api/settings                      保存设置（serversDir / clientRoots / extraWorldDirs / memory / javaPath）
+PUT  /api/settings                      保存设置（serversDir / clientRoots / extraWorldDirs / memory / javaPath / host / port）
+GET  /api/auth/state                    认证状态（免登录可读，用于登录页判断）
+POST /api/auth/login|logout             登录 / 退出（登录成功下发 HttpOnly 会话 Cookie）
+PUT  /api/auth/password                 设置 / 修改密码（已设置时必须带 current）
+PUT  /api/auth/options                  开关、免密范围、信任反代、会话天数
+GET  /api/net/self?probe=1              自身端口的映射状态 / 网关 / 外网地址
+PUT  /api/net/self                      保存自动映射配置（auto / externalPort / protocol / lease）
+POST /api/net/selfmap|unmap             立即映射 / 取消映射
+GET  /api/system/ping|info|log          探活 / 运行信息 / 最近日志
+POST /api/system/shutdown               优雅关闭（停止全部服务端后退出，供服务脚本调用）
 ```
+
+除 `/api/auth/*`、`/api/system/ping` 之外，所有接口在开启密码访问后都需要会话 Cookie，
+或本机 `X-HMCS-Control: <control.token>` 头（供服务脚本使用）。
+
 
 ## Linux 实测（Ubuntu 20.04 无桌面机）
 
@@ -273,7 +390,13 @@ PUT  /api/settings                      保存设置（serversDir / clientRoots 
 | 控制台 | `list` / `say` 有回显 |
 | 停止 | 连续 6 轮（含启动阶段中断）全部 `exit 0`，日志有 "Saving chunks"；修复前会卡 30 秒被强杀 |
 | UPnP | VM 在 NAT 后，探测优雅失败并给出中文提示，不阻塞、不报错 |
-| 前端 | 用 DOM 桩跑概览 / 设置页，无运行时错误 |
+| 前端 | 用 DOM 桩跑全部 8 个标签页（含真实实例），无运行时错误 |
+| systemd 注册 | `./install-service.sh install --port 8791` → 写 unit、`enable`、`linger` 全成功，`curl` 有应答 |
+| 服务起停 | `stop` 走优雅关闭（`ExecMainStatus=0`），`SIGTERM` 直接 `systemctl stop` 也是 0；`restart` / `--no-autostart` / `uninstall` 全部符合预期 |
+| 自启开关 | `disable` → `is-enabled=disabled` 且服务仍在跑；`enable` → `enabled` |
+| 远程访问 | 监听 `0.0.0.0`：本机 `127.0.0.1` 免密 200，局域网 IP 401 并跳 `/login`；登录后 Cookie 访问 200 |
+| 配置权限 | `settings.json` / `sessions.json` / `control.token` / `service.json` 均为 `0600` |
+| 日志落盘 | 服务模式无控制台时自动写 `~/.local/share/HMCS/logs/manager.log`，含局域网地址与登录记录 |
 
 ## 已知限制
 
@@ -282,7 +405,10 @@ PUT  /api/settings                      保存设置（serversDir / clientRoots 
 - YAML 树形编辑会丢注释（已有 `.hmcs.bak` 备份，也可切文本模式）
 - Modrinth 上部分插件未及时标注 26.3 兼容，搜索会自动放宽版本限制并列出可用版本，装前请核对
 - 端口映射依赖路由器 UPnP：网关关闭、双 NAT、CGNAT 时映射不生效（页面会给出对应提示）
-- WebUI 端口在数据目录的 `settings.json`（默认 8720），改后需重启；端口被占用会自动 +1 并在窗口打印实际地址
+- WebUI 端口固定（默认 8720），被占用时直接报错退出、不会自动换端口；改端口要改 `settings.json` 或启动参数，并重启
+- 内置服务是 **HTTP**，没有自带 TLS。经公网明文访问时密码在链路上可见，请套 HTTPS 反代或加密隧道
+- 「仅非本机免密」依赖连接的真实来源 IP；只有挂了反向代理时才该打开「信任反向代理头」，否则别人可以伪造来源绕过
+- Windows 的服务化用计划任务实现（SYSTEM 账户 + 开机启动），不是 SCM 注册的 `services.msc` 条目；关闭自启等于禁用该任务
 - Fabric 服务端 jar 由 meta.fabricmc.net 现场打包，首次请求可能要等 1-2 分钟（下载器会重试），不是卡死
 - 旧版本把实例放在程序目录里的，注册表仍按原绝对路径工作；想整理可在设置里换目录后重新导入
 

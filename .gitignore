@@ -10,6 +10,9 @@ logs/
 servers/
 settings.json
 instances.json
+sessions.json
+control.token
+service.json
 *.migrated
 *.bak
 

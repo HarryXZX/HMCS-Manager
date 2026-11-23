@@ -2,10 +2,43 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { URL } = require('url');
 const yaml = require('js-yaml');
 
-const { PUBLIC_DIR, readSettings, writeSettings, APP_DIR, SETTINGS_FILE, REGISTRY_FILE, DEFAULT_SERVERS_DIR } = require('./lib/paths');
+// ------------------------------------------------------------------ 命令行参数
+/**
+ * 只认少量参数，够服务脚本与排障用：
+ *   --port 8720        覆盖监听端口（settings.json 里也有）
+ *   --host 0.0.0.0     覆盖监听地址
+ *   --home DIR         指定配置 / 数据根目录（等价于 HMCS_HOME，服务脚本用来钉死路径）
+ *   --log-file         强制把日志写进 <数据目录>/logs/manager.log
+ *   --allow-insecure   监听非回环地址但没设密码时，仍允许启动（不建议）
+ *
+ * 必须在 require('./lib/paths') 之前解析：--home 决定配置目录，
+ * 而 paths 在模块加载时就把目录算好了。
+ */
+function parseArgs(argv) {
+  const out = { port: 0, host: '', home: '', logFile: false, allowInsecure: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const eq = a.indexOf('=');
+    const key = eq > 0 ? a.slice(0, eq) : a;
+    const inline = eq > 0 ? a.slice(eq + 1) : '';
+    const val = () => (inline || argv[++i] || '');
+    if (key === '--port' || key === '-p') out.port = Number(val());
+    else if (key === '--host' || key === '-H') out.host = val();
+    else if (key === '--home') out.home = val();
+    else if (key === '--log-file') out.logFile = true;
+    else if (key === '--allow-insecure') out.allowInsecure = true;
+  }
+  return out;
+}
+const ARGS = parseArgs(process.argv.slice(2));
+if (ARGS.home) process.env.HMCS_HOME = path.resolve(ARGS.home);
+
+const paths = require('./lib/paths');
+const { PUBLIC_DIR, readSettings, writeSettings, CONFIG_DIR, APP_DIR, SETTINGS_FILE, REGISTRY_FILE, DEFAULT_SERVERS_DIR, normalizeHost, isLoopbackHost } = paths;
 const java = require('./lib/java');
 const sources = require('./lib/sources');
 const instances = require('./lib/instances');
@@ -17,6 +50,13 @@ const modrinth = require('./lib/modrinth');
 const upnp = require('./lib/upnp');
 const eula = require('./lib/eula');
 const fsbrowse = require('./lib/fsbrowse');
+const auth = require('./lib/auth');
+const selfmap = require('./lib/selfmap');
+const logger = require('./lib/logger');
+const pkg = require('./package.json');
+// 没有控制台时（注册成服务）自动落盘，否则日志会全部丢掉
+logger.init({ toFile: ARGS.logFile || !process.stdout.isTTY });
+
 
 // ------------------------------------------------------------------ 工具
 const MIME = {
@@ -24,6 +64,28 @@ const MIME = {
   '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon',
   '.woff2': 'font/woff2', '.map': 'application/json',
 };
+
+/** 运行期状态：真正生效的端口 / 地址（可能与 settings.json 不同，CLI 参数优先） */
+const RUNTIME = {
+  port: 0,
+  host: '127.0.0.1',
+  startedAt: Date.now(),
+  shuttingDown: false,
+};
+
+/**
+ * 统一安全响应头。
+ * 管理界面不能被别的站点用 iframe 嵌进去（防点击劫持），
+ * 响应类型不许嗅探，Referer 不外泄带端口的地址。
+ */
+function securityHeaders(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), camera=(), microphone=()');
+}
+
 
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
@@ -235,6 +297,64 @@ function match(method, pathname) {
   return null;
 }
 
+// ------------------------------------------------------------------ 访问控制
+/**
+ * 登录豁免的接口：登录页自己要用的几个，以及给运维脚本探活的 ping。
+ * 其余一切 /api/ 都过 authState 判定。
+ */
+const AUTH_FREE_PATHS = new Set(['/api/auth/state', '/api/auth/login', '/api/auth/logout', '/api/system/ping']);
+
+/** settings.auth 的对外视图（绝不带哈希） */
+function publicAuth(a) {
+  return {
+    enabled: !!(a && a.enabled && a.hash),
+    onlyRemote: !a || a.onlyRemote !== false,
+    trustProxy: !!(a && a.trustProxy),
+    passwordSet: !!(a && a.hash),
+    sessionDays: (a && a.sessionDays) || 7,
+    updatedAt: (a && a.updatedAt) || '',
+    sessions: auth.sessionCount(),
+  };
+}
+
+/**
+ * 判定当前请求是否已通过认证。
+ * 三种通行证：本机来源（onlyRemote 时）、有效会话 Cookie、本机控制令牌。
+ */
+function authState(req) {
+  const a = readSettings().auth || {};
+  const ip = auth.clientIp(req, a.trustProxy);
+  const local = auth.isLoopback(ip);
+  const enabled = !!(a.enabled && a.hash);
+  const notBefore = a.updatedAt ? Date.parse(a.updatedAt) || 0 : 0;
+  const session = enabled ? auth.sessionOf(req, notBefore) : null;
+  const control = auth.checkControl(req);
+  const exempt = enabled && a.onlyRemote !== false && local;
+  return {
+    enabled, local, ip, session, control, exempt,
+    onlyRemote: a.onlyRemote !== false,
+    trustProxy: !!a.trustProxy,
+    passwordSet: !!a.hash,
+    authed: !enabled || exempt || !!session || control,
+    requiresLogin: enabled && !exempt && !session && !control,
+  };
+}
+
+/**
+ * 防跨站请求伪造：SameSite=Lax 已挡住绝大多数场景，
+ * 这里再校验一次 Origin，非浏览器客户端（无 Origin）放行。
+ */
+function originOk(req) {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return true;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const o = new URL(origin);
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '');
+    return !host || o.host === host;
+  } catch { return false; }
+}
+
 // ------------------------------------------------------------------ API
 register('GET', '/api/bootstrap', async (req, res) => {
   let settings = readSettings();
@@ -250,8 +370,26 @@ register('GET', '/api/bootstrap', async (req, res) => {
 
   const javaList = await java.list();
   const list = instances.list().map(instanceView);
+  const st = authState(req);
   sendJson(res, 200, {
+    version: pkg.version,
     settings,
+    auth: {
+      ...publicAuth(settings.auth),
+      authed: st.authed,
+      requiresLogin: st.requiresLogin,
+      local: st.local,
+      ip: st.ip,
+    },
+    net: {
+      bind: { host: RUNTIME.host, port: RUNTIME.port, localOnly: isLoopbackHost(RUNTIME.host) },
+      urls: [
+        `http://127.0.0.1:${RUNTIME.port}`,
+        ...(isLoopbackHost(RUNTIME.host) ? [] : selfmap.lanAddresses(RUNTIME.port).map(a => a.url)),
+      ],
+      selfUpnp: selfmap.status({ port: RUNTIME.port }),
+      logFile: logger.LOG_FILE,
+    },
     paths: {
       ...fsbrowse.roots(),
       serversDir: settings.serversDir || DEFAULT_SERVERS_DIR,
@@ -729,6 +867,248 @@ register('POST', '/api/upnp/auto', async (req, res) => {
   sendJson(res, 200, { ok: true, instance: upnpCfg(inst) });
 });
 
+// ---- 访问控制 / 远程访问
+register('GET', '/api/auth/state', async (req, res) => {
+  const st = authState(req);
+  const s = readSettings();
+  sendJson(res, 200, {
+    ...publicAuth(s.auth),
+    authed: st.authed,
+    requiresLogin: st.requiresLogin,
+    local: st.local,
+    ip: st.ip,
+    viaControlToken: st.control,
+    bind: { host: RUNTIME.host, port: RUNTIME.port, localOnly: isLoopbackHost(RUNTIME.host) },
+  });
+});
+
+register('POST', '/api/auth/login', async (req, res) => {
+  const a = readSettings().auth || {};
+  if (!a.enabled || !a.hash) return sendJson(res, 200, { ok: true, disabled: true, authed: true });
+
+  const ip = auth.clientIp(req, a.trustProxy);
+  const locked = auth.lockRemaining(ip);
+  if (locked) {
+    res.setHeader('Retry-After', String(locked));
+    return sendJson(res, 429, { error: `尝试过于频繁，请 ${locked} 秒后再试`, retryAfter: locked });
+  }
+
+  const body = await readJson(req);
+  const pw = String(body.password == null ? '' : body.password);
+  if (!pw) { const e = new Error('请输入密码'); e.status = 400; throw e; }
+
+  if (!auth.verifyPassword(pw, a.hash)) {
+    const sec = auth.noteFail(ip);
+    if (sec) {
+      res.setHeader('Retry-After', String(sec));
+      console.warn(`[HMCS] 登录失败触发锁定：${ip}（${sec} 秒）`);
+      return sendJson(res, 429, { error: `密码错误次数过多，请 ${sec} 秒后再试`, retryAfter: sec });
+    }
+    const left = auth.attemptsLeft(ip);
+    return sendJson(res, 401, { error: '密码错误', attemptsLeft: left });
+  }
+
+  auth.noteOk(ip);
+  const { token, exp } = auth.createSession(req, a.sessionDays);
+  res.setHeader('Set-Cookie', auth.cookieHeader(token, (exp - Date.now()) / 1000, auth.isHttps(req, a.trustProxy)));
+  console.log(`[HMCS] 登录成功：${ip}`);
+  sendJson(res, 200, { ok: true, authed: true, expiresAt: new Date(exp).toISOString() });
+});
+
+register('POST', '/api/auth/logout', async (req, res) => {
+  const a = readSettings().auth || {};
+  auth.destroySession(req);
+  res.setHeader('Set-Cookie', auth.clearCookieHeader(auth.isHttps(req, a.trustProxy)));
+  sendJson(res, 200, { ok: true });
+});
+
+// 设置 / 修改密码
+register('PUT', '/api/auth/password', async (req, res) => {
+  const a = readSettings().auth || {};
+  const body = await readJson(req);
+  const next = String(body.password == null ? '' : body.password);
+  const cur = String(body.current == null ? '' : body.current);
+  const ip = auth.clientIp(req, a.trustProxy);
+
+  // 已有密码时先验旧密码：会话被劫持也不能直接改掉密码把人锁在门外
+  if (a.hash) {
+    const locked = auth.lockRemaining(ip);
+    if (locked) {
+      res.setHeader('Retry-After', String(locked));
+      const e = new Error(`尝试过于频繁，请 ${locked} 秒后再试`); e.status = 429; throw e;
+    }
+    if (!cur) { const e = new Error('请输入当前密码'); e.status = 400; throw e; }
+    if (!auth.verifyPassword(cur, a.hash)) {
+      auth.noteFail(ip);
+      const e = new Error('当前密码不正确'); e.status = 401; throw e;
+    }
+    auth.noteOk(ip);
+  }
+
+  const pol = auth.checkPasswordPolicy(next);
+  if (!pol.ok) { const e = new Error(pol.reason); e.status = 400; throw e; }
+
+  const updatedAt = new Date().toISOString();
+  writeSettings({ auth: { ...a, enabled: true, hash: auth.hashPassword(next), updatedAt } });
+
+  // 旧会话全部作废，再给当前浏览器发一张新的，免得刚改完就被自己踢出去
+  auth.destroyAllSessions(null);
+  const { token, exp } = auth.createSession(req, a.sessionDays || 7);
+  res.setHeader('Set-Cookie', auth.cookieHeader(token, (exp - Date.now()) / 1000, auth.isHttps(req, a.trustProxy)));
+  console.log(`[HMCS] 访问密码已更新（${ip}），旧会话已全部失效`);
+  sendJson(res, 200, { ok: true, auth: publicAuth(readSettings().auth), expiresAt: new Date(exp).toISOString() });
+});
+
+// 开关与范围
+register('PUT', '/api/auth/options', async (req, res) => {
+  const a = readSettings().auth || {};
+  const body = await readJson(req);
+  const next = { ...a };
+
+  if (typeof body.enabled === 'boolean') {
+    if (body.enabled && !a.hash) { const e = new Error('请先设置访问密码'); e.status = 400; throw e; }
+    if (!body.enabled && a.hash) {
+      // 关闭防护属于降级操作，必须验密码
+      const cur = String(body.current == null ? '' : body.current);
+      if (!cur) { const e = new Error('关闭密码访问需要输入当前密码'); e.status = 400; throw e; }
+      if (!auth.verifyPassword(cur, a.hash)) { const e = new Error('当前密码不正确'); e.status = 401; throw e; }
+      auth.destroyAllSessions(null);
+    }
+    next.enabled = body.enabled;
+  }
+  if (typeof body.onlyRemote === 'boolean') next.onlyRemote = body.onlyRemote;
+  if (typeof body.trustProxy === 'boolean') next.trustProxy = body.trustProxy;
+  if (body.sessionDays !== undefined) {
+    const d = Number(body.sessionDays);
+    if (!(d >= 1 && d <= 90)) { const e = new Error('保持登录天数需在 1-90 之间'); e.status = 400; throw e; }
+    next.sessionDays = d;
+  }
+
+  writeSettings({ auth: next });
+  sendJson(res, 200, { ok: true, auth: publicAuth(readSettings().auth) });
+});
+
+// ---- 管理器自身端口（远程访问）
+register('GET', '/api/net/self', async (req, res, p, q) => {
+  const st = selfmap.status({ port: RUNTIME.port });
+  const out = {
+    ...st,
+    bind: { host: RUNTIME.host, port: RUNTIME.port, localOnly: isLoopbackHost(RUNTIME.host) },
+    externalUrl: '',
+    gateway: null,
+    gatewayError: '',
+  };
+
+  if (q.get('probe') === '1') {
+    try {
+      const d = await upnp.discover({});
+      out.gateway = { friendlyName: d.gateway.friendlyName, modelName: d.gateway.modelName };
+      try { out.externalIp = await upnp.getExternalIp(d.gateway); } catch { /* 网关不支持 */ }
+      const ext = st.added.find(x => x.protocol === 'TCP') || st.added[0];
+      if (out.externalIp && ext) out.externalUrl = `http://${out.externalIp}:${ext.externalPort}`;
+    } catch (e) {
+      out.gatewayError = e.message;
+    }
+  }
+  out.ready = !!(st.added && st.added.length);
+  out.hint = out.bind.localOnly
+    ? '当前只监听本机 127.0.0.1，端口映射建好也访问不到。先把「监听地址」改成外部可访问。'
+    : '';
+  sendJson(res, 200, out);
+});
+
+// 保存开关（auto / 外网端口 / 协议 / 租期）
+register('PUT', '/api/net/self', async (req, res) => {
+  const body = await readJson(req);
+  const cur = selfmap.cfg();
+  const ext = Number(body.externalPort);
+  const next = {
+    ...cur,
+    ...(typeof body.auto === 'boolean' ? { auto: body.auto } : {}),
+    ...(body.externalPort !== undefined ? { externalPort: ext >= 1 && ext <= 65535 ? ext : 0 } : {}),
+    ...(body.protocol !== undefined ? { protocol: ['TCP', 'UDP'].includes(body.protocol) ? body.protocol : cur.protocol } : {}),
+    ...(body.lease !== undefined && Number.isFinite(Number(body.lease)) ? { lease: Math.max(0, Number(body.lease)) } : {}),
+  };
+  if (next.auto && isLoopbackHost(RUNTIME.host)) {
+    const e = new Error('当前只监听 127.0.0.1，端口映射没有意义。请先把监听地址改为「允许外部访问」'); e.status = 400; throw e;
+  }
+  writeSettings({ selfUpnp: next });
+  sendJson(res, 200, { ok: true, self: selfmap.status({ port: RUNTIME.port }) });
+});
+
+register('POST', '/api/net/selfmap', async (req, res) => {
+  const body = await readJson(req);
+  if (isLoopbackHost(RUNTIME.host)) {
+    const e = new Error('当前只监听 127.0.0.1，先改监听地址再映射'); e.status = 400; throw e;
+  }
+  try {
+    const r = await selfmap.apply({
+      port: RUNTIME.port,
+      externalPort: body.externalPort,
+      protocol: body.protocol,
+      lease: body.lease,
+      force: !!body.force,
+      remember: body.remember !== false,
+    });
+    const st = selfmap.status({ port: RUNTIME.port });
+    sendJson(res, 200, {
+      ok: true, ...r,
+      externalUrl: r.externalIp ? `http://${r.externalIp}:${(r.added[0] || {}).externalPort}` : '',
+      self: st,
+    });
+  } catch (e) {
+    selfmap.noteError(e.message);
+    throw e;
+  }
+});
+
+register('POST', '/api/net/unmap', async (req, res) => {
+  const r = await selfmap.remove({});
+  sendJson(res, 200, { ok: true, ...r, self: selfmap.status({ port: RUNTIME.port }) });
+});
+
+// ---- 系统（服务脚本 / 排障）
+register('GET', '/api/system/ping', async (req, res) => {
+  sendJson(res, 200, { ok: true, app: 'HMCS', version: pkg.version, pid: process.pid, port: RUNTIME.port });
+});
+
+register('GET', '/api/system/info', async (req, res) => {
+  const s = readSettings();
+  sendJson(res, 200, {
+    app: pkg.version,
+    pid: process.pid,
+    node: process.version,
+    platform: process.platform,
+    arch: process.arch,
+    startedAt: new Date(RUNTIME.startedAt).toISOString(),
+    uptimeSec: Math.round((Date.now() - RUNTIME.startedAt) / 1000),
+    bind: { host: RUNTIME.host, port: RUNTIME.port, localOnly: isLoopbackHost(RUNTIME.host) },
+    urls: [
+      `http://127.0.0.1:${RUNTIME.port}`,
+      ...(isLoopbackHost(RUNTIME.host) ? [] : selfmap.lanAddresses(RUNTIME.port).map(a => a.url)),
+    ],
+    configDir: CONFIG_DIR,
+    dataDir: paths.DATA_DIR,
+    settingsFile: SETTINGS_FILE,
+    logFile: logger.LOG_FILE,
+    home: os.homedir(),
+    auth: publicAuth(s.auth),
+    running: proc.runningIds(),
+  });
+});
+
+register('GET', '/api/system/log', async (req, res, p, q) => {
+  const n = Math.min(2000, Math.max(20, Number(q.get('lines') || 200)));
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(logger.tail(n) || '(暂无日志文件内容。控制台模式下日志只输出到终端)');
+});
+
+register('POST', '/api/system/shutdown', async (req, res) => {
+  sendJson(res, 200, { ok: true, stopping: proc.runningIds().length });
+  setTimeout(() => { gracefulShutdown('API 请求'); }, 120);
+});
+
+
 // ---- 源 / Java / 设置
 register('GET', '/api/sources/versions', async (req, res, p, q) => {
   const data = await sources.listVersions(q.get('type') || 'paper');
@@ -746,6 +1126,26 @@ register('PUT', '/api/settings', async (req, res) => {
   if (typeof body.memory === 'string' && body.memory.trim()) patch.memory = body.memory.trim();
   if (typeof body.javaPath === 'string') patch.javaPath = body.javaPath;
   if (typeof body.autoAcceptEula === 'boolean') patch.autoAcceptEula = body.autoAcceptEula;
+  if (typeof body.logToFile === 'boolean') patch.logToFile = body.logToFile;
+
+  // 监听地址与端口：都属于「下次启动生效」，这里只做校验与落盘
+  if (body.host !== undefined) {
+    const h = normalizeHost(body.host);
+    if (!/^[0-9a-fA-F:.]+$/.test(h)) { const e = new Error('监听地址格式不正确'); e.status = 400; throw e; }
+    if (!isLoopbackHost(h)) {
+      const a = readSettings().auth || {};
+      if (!a.enabled || !a.hash) {
+        const e = new Error('对外开放前请先设置访问密码（安全设置 → 访问密码），否则管理面板等于裸奔');
+        e.status = 400; throw e;
+      }
+    }
+    patch.host = h;
+  }
+  if (body.port !== undefined) {
+    const p = Number(body.port);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) { const e = new Error('端口必须在 1-65535 之间'); e.status = 400; throw e; }
+    patch.port = p;
+  }
 
   // 服务端实例存放目录：必须是绝对路径，且能创建 / 可写
   if (typeof body.serversDir === 'string' && body.serversDir.trim()) {
@@ -769,7 +1169,9 @@ register('PUT', '/api/settings', async (req, res) => {
   if (body.clientRoots !== undefined) { patch.clientRoots = cleanList(body.clientRoots); patch.clientRootsDetected = true; }
   if (body.extraWorldDirs !== undefined) patch.extraWorldDirs = cleanList(body.extraWorldDirs);
 
-  sendJson(res, 200, { ok: true, settings: writeSettings(patch) });
+  const next = writeSettings(patch);
+  const restartRequired = next.port !== RUNTIME.port || normalizeHost(next.host) !== RUNTIME.host;
+  sendJson(res, 200, { ok: true, settings: next, restartRequired });
 });
 
 // ---- 目录浏览（WebUI 目录选择器）
@@ -799,23 +1201,64 @@ register('GET', '/api/clients', async (req, res, p, q) => {
 });
 
 // ------------------------------------------------------------------ 静态资源
+const STATIC_ALLOW = new Set(['.html', '.css', '.js', '.svg', '.png', '.ico', '.woff2', '.map']);
+
 function serveStatic(req, res, pathname) {
-  let rel = pathname === '/' ? '/index.html' : pathname;
+  const rel = pathname === '/' ? '/index.html' : (pathname === '/login' ? '/login.html' : pathname);
   const abs = path.join(PUBLIC_DIR, rel.replace(/^\/+/, ''));
-  if (!abs.startsWith(PUBLIC_DIR) || !fs.existsSync(abs) || fs.statSync(abs).isDirectory()) {
+  const ext = path.extname(abs).toLowerCase();
+  if (!abs.startsWith(PUBLIC_DIR) || !STATIC_ALLOW.has(ext) || !fs.existsSync(abs) || fs.statSync(abs).isDirectory()) {
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Not found');
     return;
   }
-  res.writeHead(200, { 'Content-Type': MIME[path.extname(abs).toLowerCase()] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+  res.writeHead(200, {
+    'Content-Type': MIME[ext] || 'application/octet-stream',
+    // 前端页面与脚本每次都要拿新的，避免改完刷新还是老界面
+    'Cache-Control': ext === '.html' ? 'no-store' : 'no-cache',
+  });
   fs.createReadStream(abs).pipe(res);
 }
 
 // ------------------------------------------------------------------ 启动
 const server = http.createServer(async (req, res) => {
-  const u = new URL(req.url, 'http://127.0.0.1');
-  const pathname = decodeURIComponent(u.pathname);
-  if (!pathname.startsWith('/api/')) return serveStatic(req, res, pathname);
+  securityHeaders(res);
+
+  let u;
+  try { u = new URL(req.url, 'http://127.0.0.1'); }
+  catch { return sendJson(res, 400, { error: '非法请求' }); }
+
+  let pathname;
+  try { pathname = decodeURIComponent(u.pathname); }
+  catch { return sendJson(res, 400, { error: '非法路径' }); }
+
+  if (!originOk(req)) return sendJson(res, 403, { error: '跨站请求被拒绝' });
+
+  const st = authState(req);
+
+  if (!pathname.startsWith('/api/')) {
+    // 页面本身不含敏感数据，但未登录时不该让用户对着空面板干等，直接送登录页
+    if (pathname === '/' || pathname === '/index.html' || pathname === '/login') {
+      const target = pathname === '/login' ? '/' : u.pathname + u.search;
+      if (st.requiresLogin && pathname !== '/login') {
+        res.writeHead(302, { Location: '/login?next=' + encodeURIComponent(target) });
+        return res.end();
+      }
+      if (!st.requiresLogin && pathname === '/login') {
+        res.writeHead(302, { Location: '/' });
+        return res.end();
+      }
+    }
+    return serveStatic(req, res, pathname);
+  }
+
+  if (st.requiresLogin && !AUTH_FREE_PATHS.has(pathname)) {
+    return sendJson(res, 401, { error: '需要登录后才能访问', authRequired: true, auth: publicAuth(readSettings().auth) });
+  }
+
+  if (RUNTIME.shuttingDown && pathname !== '/api/system/ping') {
+    return sendJson(res, 503, { error: 'HMCS 正在关闭中' });
+  }
 
   const hit = match(req.method, pathname);
   if (!hit) return sendJson(res, 404, { error: '接口不存在: ' + req.method + ' ' + pathname });
@@ -829,25 +1272,127 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-function listen(port, attempt) {
+// 长连接（SSE 控制台）在关闭时不该拖住进程
+server.keepAliveTimeout = 70000;
+server.headersTimeout = 75000;
+
+/** 优雅关闭：先让 Minecraft 服务端执行 stop，再收自身端口 */
+async function gracefulShutdown(reason, code = 0) {
+  if (RUNTIME.shuttingDown) return;
+  RUNTIME.shuttingDown = true;
+  const ids = proc.runningIds();
+  console.log(`[HMCS] 收到停止请求（${reason}）${ids.length ? `，正在安全关闭 ${ids.length} 个服务端…` : ''}`);
+
+  if (ids.length) {
+    await Promise.all(ids.map(id => proc.stopAndWait(id, 60000).catch(() => false)));
+  }
+  try { await selfmap.remove({ quiet: true }); } catch { /* 网关不可达就算了 */ }
+
+  try { server.close(); } catch { /* ignore */ }
+  if (server.closeAllConnections) server.closeAllConnections();
+  setTimeout(() => process.exit(code), 400).unref();
+  // 兜底：4 秒内没退干净就硬退，避免服务管理器等到超时
+  setTimeout(() => process.exit(code), 4000).unref();
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+/** 端口被占用时给出可直接照做的排查提示 */
+function portBusyHint(port) {
+  console.error(`端口 ${port} 已被其他程序占用。HMCS 使用固定端口，不会自动换端口。`);
+  if (process.platform === 'win32') {
+    console.error(`  查占用进程：netstat -ano | findstr :${port}   然后 taskkill /PID <PID> /F`);
+  } else {
+    console.error(`  查占用进程：lsof -i :${port}   或   ss -lptn 'sport = :${port}'`);
+  }
+  console.error('  或者换个端口启动：node app.js --port 8721（同时要改 settings.json 或服务配置）');
+}
+
+function start() {
+  const s = readSettings();
+  const port = Number(ARGS.port || process.env.HMCS_PORT || s.port || 8720);
+  const host = normalizeHost(ARGS.host || process.env.HMCS_HOST || s.host);
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.error(`端口 ${port} 不合法，必须是 1-65535 的整数`);
+    process.exit(2);
+  }
+  if (ARGS.port || ARGS.host) {
+    console.log(`[HMCS] 命令行覆盖监听参数：${host}:${port}（不改写 settings.json）`);
+  }
+
+  // 监听非回环地址而没设密码，等于把管理面板（含文件管理、控制台）公开到网络上
+  if (!isLoopbackHost(host)) {
+    const a = s.auth || {};
+    if (!a.enabled || !a.hash) {
+      if (!ARGS.allowInsecure) {
+        console.error('');
+        console.error('拒绝启动：监听地址是 ' + host + '，但还没有设置访问密码。');
+        console.error('管理面板能执行任意服务器指令、读写实例文件，公网暴露必须带认证。');
+        console.error('');
+        console.error('  做法一：先用 127.0.0.1 启动，在「设置 → 安全与远程访问」里设好密码，再改监听地址；');
+        console.error('  做法二：确实不需要密码（例如只在受控内网），加 --allow-insecure 启动。');
+        console.error('');
+        process.exit(2);
+      }
+      console.warn('[HMCS] 警告：未设置密码且对外监听（--allow-insecure），任何能访问该端口的人都能控制本机服务端');
+    }
+  }
+
+  RUNTIME.port = port;
+  RUNTIME.host = host;
+
+  // 提前把控制令牌写好：服务脚本要在任何请求之前就能拿到它来做优雅停止
+  try { auth.controlToken(); } catch { /* 只读目录时退化为仅进程内有效 */ }
+
   server.once('error', err => {
-    if (err.code === 'EADDRINUSE' && attempt < 12) {
-      console.log(`端口 ${port} 被占用，尝试 ${port + 1}`);
-      listen(port + 1, attempt + 1);
-    } else {
-      console.error('启动失败:', err.message);
+    if (err.code === 'EADDRINUSE') {
+      portBusyHint(port);
       process.exit(1);
     }
+    if (err.code === 'EACCES') {
+      console.error(`没有权限监听端口 ${port}（1024 以下的端口需要 root / 管理员）`);
+      process.exit(2);
+    }
+    console.error('启动失败:', err.message);
+    process.exit(1);
   });
-  server.listen(port, '127.0.0.1', () => {
+
+  server.listen(port, host, () => {
+    const localOnly = isLoopbackHost(host);
+    console.log('');
+    console.log('HYCX MC Server Manager (HMCS) v' + pkg.version + ' 已启动');
+    console.log('  本机访问  http://127.0.0.1:' + port);
+    if (!localOnly) {
+      for (const a of selfmap.lanAddresses(port)) console.log('  局域网    ' + a.url + '  (' + a.iface + ')');
+      const au = readSettings().auth;
+      console.log('  外部访问  需要密码（' + (au.onlyRemote ? '远程必填，本机免密' : '所有访问都需登录') + '）');
+    } else {
+      console.log('  监听地址  ' + host + '（仅本机；要让局域网/外网访问请改设置里的监听地址）');
+    }
+    console.log('  配置目录  ' + CONFIG_DIR);
+    console.log('  日志文件  ' + (logger.LOG_FILE || '(未启用)'));
+    console.log('');
+
     const url = `http://127.0.0.1:${port}`;
-    console.log('HYCX MC Server Manager (HMCS) 已启动');
-    console.log('  ' + url);
     try {
-      fs.writeFileSync(path.join(__dirname, 'last-url.txt'), url, 'utf8');
-    } catch { /* 程序目录只读（如 /usr/lib、/opt）时不影响启动 */ }
+      fs.writeFileSync(path.join(CONFIG_DIR, 'last-url.txt'), url, 'utf8');
+    } catch { /* 配置目录只读时不影响启动 */ }
+
+    const selfUpnp = readSettings().selfUpnp || {};
+    if (selfUpnp.auto && !localOnly) {
+      selfmap.apply({ port }).then(r => {
+        const ext = (r.added[0] || {}).externalPort;
+        console.log(`[HMCS] 已把 WebUI 端口映射到网关：${r.added.map(a => a.protocol + ' ' + a.externalPort + ' → ' + a.internalClient + ':' + a.internalPort).join('，')}`);
+        if (r.externalIp) console.log(`[HMCS] 外部访问地址  http://${r.externalIp}:${ext}`);
+      }).catch(e => {
+        console.error('[HMCS] 自动端口映射失败：' + e.message);
+        selfmap.noteError(e.message);
+      });
+    }
   });
 }
 
-const settings = readSettings();
-listen(Number(process.env.HMCS_PORT || settings.port || 8720), 0);
+start();
+
