@@ -330,7 +330,7 @@ function cmdStatus() {
   const exists = !!target && fs.existsSync(target);
   const inPath = exists && (IS_WIN ? winPathHas(BIN_DIR_WIN) : unixPathHas(path.dirname(target)));
   say('  启动器    ' + (exists ? c.green(target) : c.dim('未安装')));
-  say('  PATH      ' + (inPath ? c.green('已包含') : c.yellow('未包含')));
+  say('  PATH      ' + (exists ? (inPath ? c.green('已包含') : c.yellow('未包含')) : c.dim('—（安装后自动处理）')));
   say('  程序      ' + APP);
   say('  Node      ' + NODE);
   say('');
