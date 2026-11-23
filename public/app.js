@@ -1387,6 +1387,7 @@ async function viewSettings(i) {
         <div class="tip">端口是固定的：被别的程序占用时直接报错退出，不会自动换一个端口。<br>
           当前运行：<span class="mono">${esc(runHost)}:${esc(runPort)}</span>${pendingRestart ? '　→ 已保存为 <span class="mono">' + esc(wantHost) + ':' + esc(wantPort) + '</span>' : ''}</div>
         <div class="tip" id="s-host-warn" style="color:#f0c674"></div>
+        <div class="tip" id="s-fw-tip"></div>
       </div>
 
       ${pendingRestart ? `
@@ -1673,7 +1674,25 @@ async function viewSettings(i) {
       ? '保存并重启后，局域网 / 外网就能访问这个面板了；非本机访问必须输入密码。'
       : '还没有设置密码。后端会拒绝这个配置——先在下面点「设置密码」。';
   };
-  if (hostSel) { hostSel.onchange = hostWarn; hostWarn(); }
+  const fwTip = () => {
+    const el = $('#s-fw-tip');
+    if (!el) return;
+    const f = (state.boot.net && state.boot.net.firewall) || {};
+    const want = (Number($('#s-port') && $('#s-port').value) || wantPort);
+    const open = hostSel ? hostSel.value !== '127.0.0.1' : !lanOnly;
+    if (!open) {
+      el.style.color = '';
+      el.textContent = f.port ? `防火墙：曾放行 TCP ${f.port}，改回仅本机后规则会自动收回。` : '';
+    } else if (f.port === want) {
+      el.style.color = '#7ec49b';
+      el.textContent = `防火墙：已放行 TCP ${want} 入站（规则 ${f.rule || 'HMCS-WebUI'}）。`;
+    } else {
+      el.style.color = '#f0c674';
+      el.textContent = `防火墙：TCP ${want} 尚未自动放行。重启 HMCS 时会再试一次；若外部仍连不上，请以管理员身份运行 hmcsm firewall sync。`;
+    }
+  };
+  if (hostSel) { hostSel.onchange = () => { hostWarn(); fwTip(); }; hostWarn(); }
+  fwTip();
 
   // ---- 一键重启（改完监听地址 / 端口就不用回命令行了）
   const restartBtn = $('#s-restart');
@@ -1856,8 +1875,19 @@ async function viewSettings(i) {
         },
       });
       state.boot.settings = r.settings;
-      if (r.restartRequired) toast('已保存：端口 / 监听地址改动需要重启 HMCS 才生效', 'warn');
-      else toast('设置已保存');
+      const msgs = [];
+      let level = '';
+      if (r.restartRequired) { msgs.push('端口 / 监听地址改动需要重启 HMCS 才生效'); level = 'warn'; }
+      else msgs.push('设置已保存');
+      const fw = r.firewall;
+      if (fw) {
+        if (fw.needsPrivilege || fw.ok === false) {
+          msgs.push('防火墙未能自动放行（需要管理员 / root），请运行 hmcsm firewall sync');
+          level = 'err';
+        } else if (fw.changed && fw.needed) msgs.push(`防火墙已放行 TCP ${fw.state.port} 入站`);
+        else if (fw.changed && !fw.needed) msgs.push('防火墙放行规则已收回');
+      }
+      toast(msgs.join('；'), level);
       await refresh(true);
       if (tpl === state.tab) await renderView();
     } catch (e) { toast(e.message, 'err'); btn.disabled = false; }

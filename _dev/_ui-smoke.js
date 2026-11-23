@@ -56,7 +56,8 @@ const sandbox = {
   location: {
     search: '?tab=' + (process.env.SMOKE_TAB || 'overview') +
       (process.env.SMOKE_INST ? '&inst=' + encodeURIComponent(process.env.SMOKE_INST) : ''),
-    hash: process.env.SMOKE_HASH || '',
+    // 前端按 hash 路由（换端口重启后带 #settings 跳转），SMOKE_TAB 也映射过去
+    hash: process.env.SMOKE_HASH || (process.env.SMOKE_TAB ? '#' + process.env.SMOKE_TAB : ''),
     // 一键重启里会拼「跳转到新地址」，这些字段得给全，否则点到就抛错
     protocol: 'http:',
     hostname: '127.0.0.1',

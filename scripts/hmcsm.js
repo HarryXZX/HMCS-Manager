@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * hmcsm —— HMCS 的统一命令行入口
+ * hmcsm —— HMCS 的统一命令行入口（遥控器）
  *
- *   hmcsm                      打开服务管理（安装）菜单
+ *   hmcsm                      打开命令行控制台：启停 / 装服务 / 自启 / 密码 / 监听地址
+ *   hmcsm passwd               改访问密码（也可以用 --password 非交互）
  *   hmcsm --port 8800          以「服务」方式启动，端口写进配置
  *   hmcsm --host 0.0.0.0       同上，允许外部访问（需先设密码）
  *   hmcsm stop|start|restart|status|install|uninstall|enable|disable|open
  *
  * 两条硬规则：
- *   1. 无参数 → 调起安装/服务管理菜单，不启动任何进程；
+ *   1. 无参数 → 调起控制台菜单，不启动任何进程；
  *   2. 有参数 → 交给服务管理器拉起（Windows 计划任务 / systemd / launchd），
  *      或退化成独立后台进程。**绝不在当前终端前台跑**，
  *      所以关掉这个窗口不会把控制面板一起带走。
@@ -18,10 +19,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const http = require('http');
-const { spawn, spawnSync } = require('child_process');
+const { spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
-const APP = path.join(ROOT, 'app.js');
 const SERVICE = path.join(__dirname, 'service.js');
 const NODE = process.execPath;
 const IS_WIN = process.platform === 'win32';
@@ -61,10 +61,11 @@ preParseHome(process.argv.slice(2));
 
 const paths = require('../lib/paths');
 const pkg = require('../package.json');
+const launch = require('./launch');
 
 const SUBCOMMANDS = new Set([
   'install', 'uninstall', 'start', 'stop', 'restart',
-  'enable', 'disable', 'status', 'open', 'menu',
+  'enable', 'disable', 'status', 'open',
 ]);
 
 /** 只摘出需要落盘的项，其余原样透传给 app.js */
@@ -150,38 +151,14 @@ async function waitUp(port, host, seconds) {
   return false;
 }
 
-function isAdmin() {
-  if (!IS_WIN) return typeof process.getuid === 'function' && process.getuid() === 0;
-  const flt = spawnSync('fltmc', [], { encoding: 'utf8', windowsHide: true });
-  if (flt.status === 0) return true;
-  const net = spawnSync('net', ['session'], { encoding: 'utf8', windowsHide: true, shell: true });
-  return net.status === 0;
-}
-
-// ------------------------------------------------------------------ 无参数：调起安装菜单
+// ------------------------------------------------------------------ 无参数：调起控制台菜单
+/**
+ * 菜单本身不需要管理员权限：看状态、启停、改密码、改监听地址、改端口都能干；
+ * 只有「安装 / 卸载系统服务」和「开机自启」这两类专业操作要提权，
+ * 到那一步再单独弹 UAC（见 menu.js 的 elevateWin），不用一进来就把整个菜单提权。
+ */
 function openMenu() {
-  if (IS_WIN && !isAdmin()) {
-    // 菜单第一项就是「安装服务」，那一步需要写计划任务，普通权限必然失败。
-    // 直接提权开一个新窗口跑菜单，省得用户点进去报错再回来。
-    const q = s => String(s).replace(/'/g, "''");
-    const ps = `Start-Process -FilePath '${q(NODE)}' ` +
-      `-ArgumentList '"${q(SERVICE)}"','menu' -Verb RunAs`;
-    say('  ' + dim('安装 / 卸载服务需要管理员权限，正在请求提权…'));
-    say('  ' + dim('（弹出「用户账户控制」时请点「是」）'));
-    const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], {
-      encoding: 'utf8', windowsHide: true, timeout: 20000,
-    });
-    if (r.status === 0) {
-      say('');
-      ok('已在管理员窗口打开服务管理');
-      say('');
-      return 0;
-    }
-    warn('没有提权成功（点了「否」，或这台机器不允许 UAC 提权），改在当前窗口打开');
-    say('  ' + dim('当前窗口不是管理员，安装 / 卸载那两项会失败。'));
-  }
-  const r = runService(['menu']);
-  return r.status === null ? 0 : r.status;
+  return require('./menu').runMenu().then(() => 0);
 }
 
 // ------------------------------------------------------------------ 有参数：以服务方式启动
@@ -208,40 +185,14 @@ function applySettings(boot) {
   return { changed: true, settings: next };
 }
 
-/** 服务路径走不通时的退路：脱离终端的独立进程，关窗口不影响 */
+/** 服务路径走不通时的退路：脱离终端的独立进程（实现在 launch.js，菜单也用它） */
 function spawnDetached(boot, settings) {
-  const port = settings.port || 8720;
-  const args = [APP];
-  if (boot.port) args.push('--port', String(boot.port));
-  if (boot.host) args.push('--host', boot.host);
-  if (boot.home) args.push('--home', boot.home);
-  args.push(...boot.pass);
-  if (!args.includes('--log-file')) args.push('--log-file');
-
-  let child;
-  try {
-    child = spawn(process.execPath, args, {
-      cwd: ROOT,
-      // detached + ignore：新进程不挂在当前控制台上，
-      // Windows 上是 DETACHED_PROCESS，POSIX 上是 setsid，关终端不会收到 SIGHUP。
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-      env: { ...process.env, HMCS_BACKGROUND: '1' },
-    });
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-  child.unref();
-
-  try {
-    fs.mkdirSync(paths.CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(path.join(paths.CONFIG_DIR, 'background.pid'),
-      JSON.stringify({ pid: child.pid, port, host: settings.host, startedAt: new Date().toISOString() }, null, 2),
-      { encoding: 'utf8', mode: 0o600 });
-  } catch { /* 只读目录不影响运行 */ }
-
-  return { ok: true, pid: child.pid, port };
+  return launch.spawnDetached({
+    port: boot.port || settings.port,
+    host: boot.host || settings.host,
+    home: boot.home,
+    extraArgs: boot.pass,
+  });
 }
 
 function tailLog(lines = 12) {
@@ -352,10 +303,18 @@ function sayHelp() {
   say(`
 HMCS · HYCX MC Server Manager  v${pkg.version}
 
-  hmcsm                         打开服务管理菜单（安装 / 卸载 / 起停 / 自启）
+  hmcsm                         打开命令行控制台（推荐；启停 / 安装 / 自启 / 密码 / 监听地址都在里面）
   hmcsm --port 8800             以服务方式启动，端口改存为 8800
   hmcsm --host 0.0.0.0          允许局域网 / 外网访问（必须先设密码）
   hmcsm --port 8800 --host 0.0.0.0
+
+安全与访问
+  hmcsm passwd                  改访问密码（提示输入两次，不回显）
+  hmcsm passwd --password xxx   非交互改密码（脚本里用）
+  hmcsm firewall                查看防火墙放行状态
+  hmcsm firewall sync          按配置同步防火墙规则（Linux 用 sudo）
+  hmcsm firewall on | off      手动放行 / 收回入站端口
+  hmcsm menu                    直接打开命令行控制台
 
 服务命令（等价于 install-service.sh / 安装服务.bat 里的同名项）
   hmcsm install                 注册为系统服务并启动
@@ -366,11 +325,48 @@ HMCS · HYCX MC Server Manager  v${pkg.version}
   hmcsm open                    在浏览器打开管理界面
 
 说明
-  无参数进菜单，有参数才启动；启动后进程由服务管理器托管，
-  不挂在这个终端下，关窗口不影响。
+  无参数进控制台，有参数才启动；启动后进程不挂在这个终端下，关窗口不影响。
+  hmcsm 只是遥控器 —— 它退出、甚至被 Ctrl+C 掉，管理面板照常在跑。
   配置目录  ${paths.CONFIG_DIR}
   程序目录  ${ROOT}
 `);
+}
+
+/** 防火墙规则：委托给独立脚本，便于 Windows 提权时单独拉起 */
+function runFirewall(args) {
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'firewall-cli.js'), ...args], {
+    cwd: ROOT, stdio: 'inherit', timeout: 120000,
+  });
+  return r.status === null ? 0 : r.status;
+}
+
+/**
+ * 终端里改密码。
+ *
+ * 走本机运维通道：面板在跑就用它（旧会话立刻全部失效、不用重启）；
+ * 没在跑就直接写 settings.json。所以不需要旧密码 —— 能跑这条命令，
+ * 就等于已经能读写这台机器的配置目录了。
+ */
+async function cmdPasswd(argv) {
+  const menu = require('./menu');
+  const st = await menu.actions.snapshot();
+
+  const i = argv.findIndex(a => a === '--password' || a === '-P');
+  const forced = i >= 0 ? String(argv[i + 1] || '') : '';
+
+  if (forced) {
+    const pol = require('../lib/auth').checkPasswordPolicy(forced);
+    if (!pol.ok) { bad(pol.reason); return 1; }
+    const done = await menu.actions.applyAuth(st, { password: forced }, '访问密码已更新');
+    return done ? 0 : 1;
+  }
+
+  if (!process.stdin.isTTY) {
+    bad('非交互环境请用：hmcsm passwd --password <新密码>');
+    return 1;
+  }
+  await menu.actions.setPassword(st);
+  return 0;
 }
 
 // ------------------------------------------------------------------ 入口
@@ -395,12 +391,17 @@ async function main() {
     say(pkg.version);
     return 0;
   }
+  // 控制台菜单（service.js 的 menu 子命令也会转到这里，保证两处看到的是同一套）
+  if (head === 'menu' || head === '--menu') return openMenu();
+  // 改密码：hmcsm passwd [--password xxx]
+  if (head === 'passwd' || head === 'password') return cmdPasswd(argv);
+  // 防火墙：hmcsm firewall [status|sync|on|off]
+  if (head === 'firewall' || head === 'fw') return runFirewall(argv.slice(1));
   // 服务子命令：原样交给 service.js，它才是实现方
   if (SUBCOMMANDS.has(head)) {
     const r = runService(argv);
     return r.status === null ? 0 : r.status;
   }
-
   const boot = parseBoot(argv);
   const applied = applySettings(boot);
   if (applied.error) return 2;

@@ -54,6 +54,7 @@ const fsbrowse = require('./lib/fsbrowse');
 const auth = require('./lib/auth');
 const selfmap = require('./lib/selfmap');
 const logger = require('./lib/logger');
+const firewall = require('./lib/firewall');
 const pkg = require('./package.json');
 // 没有控制台时（注册成服务）自动落盘，否则日志会全部丢掉
 logger.init({ toFile: ARGS.logFile || !process.stdout.isTTY });
@@ -389,6 +390,12 @@ register('GET', '/api/bootstrap', async (req, res) => {
         ...(isLoopbackHost(RUNTIME.host) ? [] : selfmap.lanAddresses(RUNTIME.port).map(a => a.url)),
       ],
       selfUpnp: selfmap.status({ port: RUNTIME.port }),
+      // 轻量：只读状态文件，不在这里跑 netsh / ufw 探测
+      firewall: {
+        rule: firewall.RULE_NAME,
+        port: firewall.statePort(),
+        needed: !isLoopbackHost(RUNTIME.host),
+      },
       logFile: logger.LOG_FILE,
     },
     paths: {
@@ -960,6 +967,65 @@ register('PUT', '/api/auth/password', async (req, res) => {
   sendJson(res, 200, { ok: true, auth: publicAuth(readSettings().auth), expiresAt: new Date(exp).toISOString() });
 });
 
+/**
+ * 本机运维通道：改密码 / 开关校验 / 改免密范围，**不需要旧密码**。
+ *
+ * 给 `hmcsm` 的菜单用。面板可能根本没登录，甚至密码已经忘了 —— 但本机进程能读到
+ * <配置目录>/control.token（0600，只有本机同一用户可读），那本来就等价于
+ * 「能改这台机器的配置」，再要一遍旧密码只是仪式感。
+ *
+ * 双保险：只接受回环来源 + 常量时间比对 token。改完立即作废所有会话，
+ * 且不需要重启进程（readSettings 每次都读文件，新哈希下一次校验就生效）。
+ */
+register('POST', '/api/auth/local', async (req, res) => {
+  const cur = readSettings().auth || {};
+  const ip = auth.clientIp(req, cur.trustProxy);
+  if (!auth.isLoopback(ip)) { const e = new Error('这个接口只允许在本机调用'); e.status = 403; throw e; }
+  if (!auth.checkControl(req)) { const e = new Error('控制令牌无效（control.token 不匹配）'); e.status = 403; throw e; }
+
+  const body = await readJson(req);
+  const a = { ...(readSettings().auth || {}) };
+  const actions = [];
+
+  if (body.clear === true) {
+    if (!isLoopbackHost(readSettings().host)) {
+      const e = new Error('监听地址不是「仅本机」，清掉密码后程序会拒绝重启。先把它改成 127.0.0.1 再来');
+      e.status = 400; throw e;
+    }
+    a.hash = '';
+    a.enabled = false;
+    actions.push('已关闭密码访问');
+  } else if (body.password !== undefined) {
+    const pw = String(body.password == null ? '' : body.password);
+    const pol = auth.checkPasswordPolicy(pw);
+    if (!pol.ok) { const e = new Error(pol.reason); e.status = 400; throw e; }
+    a.hash = auth.hashPassword(pw);
+    a.enabled = true;
+    actions.push('访问密码已更新');
+  }
+
+  if (typeof body.enabled === 'boolean') {
+    if (body.enabled && !a.hash) { const e = new Error('还没有设置密码，无法启用校验'); e.status = 400; throw e; }
+    a.enabled = body.enabled;
+    actions.push(body.enabled ? '密码校验已开启' : '密码校验已关闭（保留密码）');
+  }
+  if (typeof body.onlyRemote === 'boolean') {
+    a.onlyRemote = body.onlyRemote;
+    actions.push(body.onlyRemote ? '本机免密已开启（仅远程需要密码）' : '所有访问都需要密码');
+  }
+
+  if (!actions.length) { const e = new Error('没有要修改的项'); e.status = 400; throw e; }
+
+  a.updatedAt = new Date().toISOString();
+  writeSettings({ auth: a });
+  if (body.password !== undefined || body.clear === true || body.enabled === false) {
+    // 密码变了 / 校验关了 → 旧会话必须立刻作废，否则等于没改
+    auth.destroyAllSessions(null);
+  }
+  console.log(`[HMCS] 本机命令修改了访问控制（${ip}）：${actions.join('，')}`);
+  sendJson(res, 200, { ok: true, changes: actions, auth: publicAuth(readSettings().auth) });
+});
+
 // 开关与范围
 register('PUT', '/api/auth/options', async (req, res) => {
   const a = readSettings().auth || {};
@@ -1117,6 +1183,31 @@ register('GET', '/api/system/log', async (req, res, p, q) => {
   res.end(logger.tail(n) || '(暂无日志文件内容。控制台模式下日志只输出到终端)');
 });
 
+/**
+ * 本机运维：同步 / 收回防火墙规则。
+ *
+ * 菜单是「遥控器」，改完监听配置后优先让正在运行的服务进程（多半有 SYSTEM / root）
+ * 去写防火墙，省得为每个小操作都弹一次 UAC。同样只认回环来源 + control token。
+ */
+register('POST', '/api/system/firewall', async (req, res) => {
+  const s = readSettings();
+  const ip = auth.clientIp(req, s.auth && s.auth.trustProxy);
+  if (!auth.isLoopback(ip)) { const e = new Error('这个接口只允许在本机调用'); e.status = 403; throw e; }
+  if (!auth.checkControl(req)) { const e = new Error('控制令牌无效（control.token 不匹配）'); e.status = 403; throw e; }
+
+  const body = await readJson(req);
+  const host = body.host !== undefined ? normalizeHost(body.host) : normalizeHost(s.host);
+  const port = body.port !== undefined ? Number(body.port) : (Number(s.port) || RUNTIME.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    const e = new Error('端口必须在 1-65535 之间'); e.status = 400; throw e;
+  }
+  const onLog = msg => console.log(msg);
+  const result = body.remove === true
+    ? firewall.removeAll({ onLog })
+    : firewall.sync({ host, port, force: body.force === true, onLog });
+  sendJson(res, 200, result);
+});
+
 register('POST', '/api/system/shutdown', async (req, res) => {
   sendJson(res, 200, { ok: true, stopping: proc.runningIds().length });
   setTimeout(() => { gracefulShutdown('API 请求'); }, 120);
@@ -1200,9 +1291,27 @@ register('PUT', '/api/settings', async (req, res) => {
   if (body.clientRoots !== undefined) { patch.clientRoots = cleanList(body.clientRoots); patch.clientRootsDetected = true; }
   if (body.extraWorldDirs !== undefined) patch.extraWorldDirs = cleanList(body.extraWorldDirs);
 
+  const prev = readSettings();
   const next = writeSettings(patch);
   const restartRequired = next.port !== RUNTIME.port || normalizeHost(next.host) !== RUNTIME.host;
-  sendJson(res, 200, { ok: true, settings: next, restartRequired });
+
+  // 开关公网访问 / 改端口时，一并写防火墙。按「目标配置」同步：
+  // 规则提前放好没坏处，等重启后就正好对上；点「撤销改动」时又会收回。
+  // 只有监听配置真的变了才跑，改内存 / 目录之类的保存不受影响。
+  const netChanged = (patch.host !== undefined && patch.host !== prev.host) ||
+    (patch.port !== undefined && patch.port !== prev.port);
+  let firewallResult = null;
+  if (netChanged) {
+    try {
+      firewallResult = firewall.sync({
+        host: next.host, port: Number(next.port) || RUNTIME.port,
+        onLog: s => console.log(s),
+      });
+    } catch (e) {
+      firewallResult = { ok: false, needsPrivilege: true, manual: [], warning: '防火墙同步异常：' + e.message };
+    }
+  }
+  sendJson(res, 200, { ok: true, settings: next, restartRequired, firewall: firewallResult });
 });
 
 // ---- 目录浏览（WebUI 目录选择器）
@@ -1424,6 +1533,17 @@ function start() {
     try {
       fs.writeFileSync(path.join(CONFIG_DIR, 'last-url.txt'), url, 'utf8');
     } catch { /* 配置目录只读时不影响启动 */ }
+
+    // 公网访问必须连带放行防火墙。服务进程常跑在 SYSTEM / root 下，
+    // 这里按「实际监听值」做一次幂等同步，覆盖服务 / 后台 / 手动等所有启动路径；
+    // 权限不够也只记日志，不拦着面板启动。
+    setImmediate(() => {
+      try {
+        firewall.sync({ host, port, onLog: s => console.log(s) });
+      } catch (e) {
+        console.warn('[HMCS] 防火墙同步异常：' + e.message);
+      }
+    });
 
     const selfUpnp = readSettings().selfUpnp || {};
     if (selfUpnp.auto && !localOnly) {

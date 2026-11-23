@@ -60,7 +60,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   // ---- 1. 帮助 / 版本
   let r = run(['--help']);
   check('--help 退出码 0', r.status === 0, 'status=' + r.status);
-  check('--help 说明无参数进菜单', /无参数进菜单/.test(r.stdout));
+  check('--help 说明无参数进菜单', /无参数进(菜单|控制台)/.test(r.stdout));
   check('--help 列出服务子命令', /hmcsm install/.test(r.stdout) && /hmcsm status/.test(r.stdout));
 
   r = run(['--version']);

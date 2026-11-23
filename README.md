@@ -19,9 +19,12 @@
   lib/                sources（核心源）/ instances（实例注册表）/ fsbrowse（目录浏览）
                       proc（进程托管）/ worlds（存档）/ props / eula / upnp
                       auth（密码/会话/限流）/ selfmap（自身端口映射）/ logger（日志落盘）
+                      firewall（跨平台防火墙放行 / 收回）
   public/             前端（原生 JS，无构建）；login.html 是独立的登录页
-  scripts/            service.js（服务注册与管理）/ reset-password.js（重置密码）
-  _dev/               自测脚本（模拟 UPnP 网关、认证用例、hmcsm 命令、前端冒烟测试、重启/换端口生效），可整个删除
+  scripts/            hmcsm.js（命令行入口）/ menu.js（命令行控制台）/ service.js（服务注册与管理）
+                      firewall-cli.js（防火墙）/ install-cli.js（写 PATH）/ launch.js（脱离终端启动）
+                      prompt.js（终端输入）/ reset-password.js（重置密码）
+  _dev/               自测脚本（UPnP 网关、认证、hmcsm、防火墙、前端冒烟、重启/换端口生效），可整个删除
   启动.bat            Windows 中文版（GBK 编码）
   start.bat           Windows 英文版（控制台无中文时用）
   安装服务.bat        Windows：注册 / 起停 / 自启 / 卸载（会请求管理员权限）
@@ -46,6 +49,7 @@ Linux 按 [XDG Base Directory](https://specifications.freedesktop.org/basedir-sp
   sessions.json     会话表（只存令牌的 SHA-256，不存可用 Cookie）
   control.token     本机运维凭据（服务脚本用来优雅停止，0600）
   service.json      服务注册时写死的启动参数（端口 / 地址 / 后端类型）
+  firewall-state.json  防火墙里由 HMCS 建的放行规则（用于精确删除、避免重复添加）
   servers/          默认实例存放目录（可在设置里改成任意位置）
   logs/             运行日志（仅 Linux 在 data 目录；Windows / macOS 与配置同目录）
 ```
@@ -86,12 +90,26 @@ node scripts/install-cli.js uninstall   # 卸
 装完**新开一个终端**（旧窗口读的还是旧 PATH），之后：
 
 ```bash
-hmcsm                        # 打开服务管理菜单：安装 / 起停 / 开机自启 / 卸载
+hmcsm                        # 打开命令行控制台（启停 / 安装 / 自启 / 密码 / 公网 / 防火墙）
+hmcsm passwd                 # 改访问密码（两次输入，不回显；不需要旧密码）
+hmcsm firewall sync          # 按配置同步防火墙规则
 hmcsm --port 8800            # 以服务方式启动，端口存为 8800
 hmcsm --host 0.0.0.0         # 允许局域网 / 外网访问（必须先设密码）
 hmcsm stop                   # 停止（会先让 Minecraft 存档退出）
 hmcsm status                 # 查看状态
 ```
+
+`hmcsm` 不带参数进的是命令行控制台，一个进程内的菜单把这些都收在一起：
+
+| | |
+| --- | --- |
+| 服务 | 启动 / 停止 / 重启 |
+| 安装 | 安装 / 卸载系统服务（开机自动跑） |
+| 自启 | 开启 / 关闭开机自启 |
+| 命令 | 安装 / 卸载 `hmcsm` 命令（写 PATH） |
+| 其他 | 打开管理界面、公网访问与密码、查看详细状态 |
+
+菜单是**遥控器**：每个动作都是一次独立命令，退出菜单、甚至 Ctrl+C 都不会影响正在运行的面板。公网访问那一项里可以设密码、开关校验、切换免密范围、改监听地址 / 端口，**并一并同步防火墙**。
 
 **两条规则：**
 
@@ -167,6 +185,30 @@ WebUI 端口是**固定**的，默认 `8720`。取值优先级：命令行 `--po
 3. 点保存，页面出现黄条后点 **「立即重启」**（或自己重启 HMCS）
 
 顺序不能反。**监听非回环地址却没有密码时，程序拒绝启动**（退出码 2），因为管理面板能执行任意服务器指令、读写实例文件、删世界存档，裸奔到网络上等于把机器交出去。确实不需要密码的场景（受控内网）可以加 `--allow-insecure`。
+
+### 防火墙：开关公网访问时一并处理
+
+只把监听地址从 `127.0.0.1` 改成 `0.0.0.0` 还不够 —— Windows Defender 防火墙、`ufw`、`firewalld` 默认会拦掉外部发起的入站连接，表现就是「界面显示已开放，但局域网连不上」。所以切换监听地址 / 端口时会顺带把防火墙改好：
+
+| 平台 | 做法 | 需要权限 |
+| --- | --- | --- |
+| Windows | `netsh advfirewall` 加入站放行规则，规则名固定 `HMCS-WebUI` | 管理员 |
+| Linux | `ufw allow <端口>/tcp`（优先）或 `firewall-cmd --add-port`；防火墙没启用就跳过 | root |
+| macOS | 默认允许访问已监听端口，跳过 | — |
+
+- **开公网** → 放行当前端口；**改端口** → 删旧端口、加新端口；**改回仅本机** → 收回规则
+- 规则只按 `HMCS-WebUI` 这个名字或自己记过的端口删除，不动你自己配的其它规则
+- 状态记在 `<配置目录>/firewall-state.json`，重复启动不会反复执行命令；规则被安全软件清掉后会自动补回
+- **权限不够时不会假装成功**：日志和界面都会提示「需要管理员 / root」，并给出一条可直接复制的手动命令。服务模式下进程本身是 SYSTEM / root，通常自动就成；普通终端里改的话，Windows 会单独弹一次 UAC，Linux 用 `sudo hmcsm firewall sync`
+- 设置页「远程访问」卡片里会实时显示：已放行 / 尚未放行 / 待收回
+
+命令行也能单独处理：
+
+```bash
+hmcsm firewall            # 看现在放行了没有
+hmcsm firewall sync       # 按当前配置同步（Linux 加 sudo）
+hmcsm firewall on | off   # 强制放行 / 收回
+```
 
 | 机制 | 实现 |
 | --- | --- |
@@ -434,6 +476,8 @@ POST /api/reveal                        在资源管理器里打开路径
 GET  /api/clients                       探测本机客户端实例（只读建议）
 PUT  /api/settings                      保存设置（serversDir / clientRoots / extraWorldDirs / memory / javaPath / host / port）
 POST /api/system/restart                重启自己（改完端口 / 监听地址不用回命令行）
+POST /api/system/firewall               同步 / 收回防火墙规则（control token，仅本机）
+POST /api/auth/local                    本机运维改密码 / 开关校验 / 免密范围（control token，不要旧密码）
 POST /api/system/shutdown               优雅停止（服务脚本用）
 GET  /api/auth/state                    认证状态（免登录可读，用于登录页判断）
 POST /api/auth/login|logout             登录 / 退出（登录成功下发 HttpOnly 会话 Cookie）
@@ -443,7 +487,6 @@ GET  /api/net/self?probe=1              自身端口的映射状态 / 网关 / �
 PUT  /api/net/self                      保存自动映射配置（auto / externalPort / protocol / lease）
 POST /api/net/selfmap|unmap             立即映射 / 取消映射
 GET  /api/system/ping|info|log          探活 / 运行信息 / 最近日志（ping 支持跨源读，供换端口后探活）
-POST /api/system/shutdown               优雅关闭（停止全部服务端后退出，供服务脚本调用）
 ```
 
 除 `/api/auth/*`、`/api/system/ping` 之外，所有接口在开启密码访问后都需要会话 Cookie，
@@ -481,9 +524,11 @@ POST /api/system/shutdown               优雅关闭（停止全部服务端后�
 - YAML 树形编辑会丢注释（已有 `.hmcs.bak` 备份，也可切文本模式）
 - Modrinth 上部分插件未及时标注 26.3 兼容，搜索会自动放宽版本限制并列出可用版本，装前请核对
 - 端口映射依赖路由器 UPnP：网关关闭、双 NAT、CGNAT 时映射不生效（页面会给出对应提示）
+- 防火墙只自动处理 `netsh` / `ufw` / `firewalld`；自定义 `iptables` / `nftables` 规则需要自己维护（CLI 会给出提示）
 - WebUI 端口固定（默认 8720），被占用时直接报错退出、不会自动换端口；改端口/监听地址在设置页里改，保存后点「立即重启」即可生效（服务模式同样适用，因为这两个值不在服务启动参数里）。换了端口页面会自动跳到新地址，但跳过去是**另一个 origin**，新 origin 下的实例选择（`localStorage`）不会跟着过去，会自动落到第一个实例
 - 改成「仅本机」后又想从局域网访问，只能回本机改成 `0.0.0.0`——远程已经进不来了，这是设计如此
 - 「一键重启」在 systemd 下依赖 unit 里的 `Restart=always`；如果你是手工写的 unit，需要自己保证这一点，否则程序退出后就真停了
+- 防火墙放行需要管理员 / root：Windows 计划任务（SYSTEM）、systemd 系统级服务通常自动成功；用户级服务或普通终端里改配置时可能失败，会提示手动执行 `hmcsm firewall sync`（Windows 会单独弹一次 UAC）。macOS 不做处理（默认不拦已监听端口）
 - 内置服务是 **HTTP**，没有自带 TLS。经公网明文访问时密码在链路上可见，请套 HTTPS 反代或加密隧道
 - 「仅非本机免密」依赖连接的真实来源 IP；只有挂了反向代理时才该打开「信任反向代理头」，否则别人可以伪造来源绕过
 - Windows 的服务化用计划任务实现（SYSTEM 账户 + 开机启动），不是 SCM 注册的 `services.msc` 条目；关闭自启等于禁用该任务

@@ -841,13 +841,31 @@ async function safeStart() {
 
 async function cmdStart() {
   const d = BACKEND.describe();
-  if (!d.installed) die('服务还没安装。先运行：node scripts/service.js install');
   const live = await livePort();
   if (live) {
     warn('HMCS 已经在运行（127.0.0.1:' + live + '）');
     if (live !== PORT) say(c.dim('  但它监听的是旧端口，配置里已经是 ' + PORT + ' —— 用 restart 才能换过来。'));
     return;
   }
+
+  // 没注册服务也能启动：退化成独立后台进程（关终端不影响）。
+  // 先装服务再启动太绕了 —— 「启动」本来就该直接能把面板跑起来。
+  if (!d.installed) {
+    say(c.dim('  服务尚未安装，改为启动独立后台进程（要开机自启再执行 install）…'));
+    const r = require('./launch').spawnDetached({ port: PORT, host: HOST });
+    if (!r.ok) { bad('后台启动失败：' + r.error); process.exitCode = 1; return; }
+    for (let i = 0; i < 30; i++) {
+      await sleep(500);
+      if (await isUp()) {
+        ok('已启动（独立后台进程 pid=' + r.pid + '）：http://127.0.0.1:' + PORT);
+        return;
+      }
+    }
+    bad('进程已拉起（pid ' + r.pid + '），但 15 秒内端口没响应，看日志 ' + path.join(LOG_DIR, 'manager.log'));
+    process.exitCode = 1;
+    return;
+  }
+
   await safeStart();
   for (let i = 0; i < 20; i++) {
     await sleep(500);
@@ -921,71 +939,12 @@ function cmdDisable() {
 }
 
 // ================================================================== 交互菜单
-function ask(question, def = '') {
-  return new Promise(resolve => {
-    const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(question, ans => { rl.close(); resolve(String(ans || '').trim() || def); });
+// 菜单只有一份实现（scripts/menu.js），这里转过去，避免两套菜单长得不一样。
+function menu() {
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'hmcsm.js'), 'menu'], {
+    cwd: ROOT, stdio: 'inherit', timeout: 3600000,
   });
-}
-
-async function menu() {
-  for (;;) {
-    const d = BACKEND.describe();
-    const ping = await httpJson('/api/system/ping', { timeout: 900 });
-    say('');
-    line();
-    say(c.bold('  HYCX MC Server Manager · 服务管理'));
-    line();
-    say('  程序目录  ' + ROOT);
-    say('  数据目录  ' + CONFIG_DIR);
-    say('  监听      ' + HOST + ':' + PORT + (LOCAL_ONLY ? c.yellow('  （仅本机）') : ''));
-    say('  访问密码  ' + (SETTINGS.auth && SETTINGS.auth.enabled ? c.green('已设置') : c.yellow('未设置')));
-    say('  服务状态  ' + (d.installed
-      ? (d.running ? c.green('已安装 · 运行中') : c.dim('已安装 · 已停止')) + (d.autostart ? c.green(' · 开机自启') : c.dim(' · 不自启'))
-      : c.dim('未安装')) + (ping.ok ? c.green('  [端口有应答]') : ''));
-    line();
-    say('  1) 安装 / 重装服务');
-    say('  2) 启动服务');
-    say('  3) 停止服务');
-    say(`  4) ${d.autostart ? '关闭' : '开启'}开机自启` + (d.installed ? '' : c.dim('  (需先安装)')));
-    say('  5) 查看状态');
-    say('  6) 卸载服务');
-    say('  7) 打开管理界面');
-    say('  8) 安装 hmcsm 命令到 PATH');
-    say('  q) 退出');
-    say('');
-
-    const a = await ask('  请输入序号：');
-    if (a === 'q' || a === 'Q' || a === 'quit' || a === 'exit') return;
-    try {
-      switch (a) {
-        case '1': await cmdInstall(); break;
-        case '2': await cmdStart(); break;
-        case '3': await cmdStop(); break;
-        case '4':
-          if (!d.installed) { warn('请先安装服务'); break; }
-          if (d.autostart) cmdDisable(); else cmdEnable();
-          break;
-        case '5': await cmdStatus(); break;
-        case '6':
-          if (!d.installed) { warn('服务未安装'); break; }
-          if (await ask('  确认卸载服务？(y/N)：', 'n') === 'y') cmdUninstall();
-          break;
-        case '7': openBrowser(); break;
-        case '8': installCli(); break;
-        default: warn('没有这个选项');
-      }
-    } catch (e) {
-      bad(e.message || String(e));
-    }
-  }
-}
-
-/** 把 hmcsm 命令装进 PATH（具体逻辑都在 install-cli.js 里） */
-function installCli() {
-  const script = path.join(__dirname, 'install-cli.js');
-  const r = spawnSync(process.execPath, [script, 'install'], { stdio: 'inherit' });
-  if (r.status !== 0) warn('hmcsm 命令安装失败，可手动运行：node scripts/install-cli.js install');
+  return r.status === null ? 0 : r.status;
 }
 
 function openBrowser() {  const url = `http://127.0.0.1:${PORT}`;
