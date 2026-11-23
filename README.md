@@ -21,7 +21,7 @@
                       auth（密码/会话/限流）/ selfmap（自身端口映射）/ logger（日志落盘）
   public/             前端（原生 JS，无构建）；login.html 是独立的登录页
   scripts/            service.js（服务注册与管理）/ reset-password.js（重置密码）
-  _dev/               自测脚本（模拟 UPnP 网关、认证用例、前端冒烟测试），可整个删除
+  _dev/               自测脚本（模拟 UPnP 网关、认证用例、hmcsm 命令、前端冒烟测试），可整个删除
   启动.bat            Windows 中文版（GBK 编码）
   start.bat           Windows 英文版（控制台无中文时用）
   安装服务.bat        Windows：注册 / 起停 / 自启 / 卸载（会请求管理员权限）
@@ -61,7 +61,7 @@ Linux 按 [XDG Base Directory](https://specifications.freedesktop.org/basedir-sp
 | Windows | 双击 **`启动.bat`**（中文提示，GBK 编码）；若控制台乱码改双击 `start.bat` |
 | macOS | 双击 **`start-macos.command`**（首次可能需右键 → 打开）；或在终端 `./start.sh` |
 | Linux | `./start.sh` |
-| 任意系统 | 装一次 **`hmcsm`** 命令（见下），以后任意目录敲 `hmcsm` 即可 |
+| 任意系统 | 装一次 **`hmcsm`** 命令（见下），以后 `hmcsm --port 8720` 就能后台起服务 |
 | 任意系统 | `npm install && npm start`（从源码直接跑） |
 | 装成后台服务（开机自启） | Windows `安装服务.bat`；Linux / macOS `./install-service.sh`（详见下方「注册成系统服务」） |
 
@@ -86,14 +86,27 @@ node scripts/install-cli.js uninstall   # 卸
 装完**新开一个终端**（旧窗口读的还是旧 PATH），之后：
 
 ```bash
-hmcsm                     # 用已保存的端口和监听地址启动
-hmcsm --port 8720         # 临时换端口
-hmcsm --host 0.0.0.0      # 临时允许外部访问（前提是已经设了密码）
+hmcsm                        # 打开服务管理菜单：安装 / 起停 / 开机自启 / 卸载
+hmcsm --port 8800            # 以服务方式启动，端口存为 8800
+hmcsm --host 0.0.0.0         # 允许局域网 / 外网访问（必须先设密码）
+hmcsm stop                   # 停止（会先让 Minecraft 存档退出）
+hmcsm status                 # 查看状态
 ```
+
+**两条规则：**
+
+| 调用方式 | 行为 |
+| --- | --- |
+| **不带任何参数** | 只调起服务管理菜单，不启动任何进程。Windows 会请求管理员权限（安装服务要写计划任务） |
+| **带参数** | 以**服务方式**启动：Windows 计划任务 / `systemd` / `launchd`。进程不挂在这个终端下，**关掉窗口不会跟着退出** |
+
+服务方式启动时，`--port` / `--host` 会被写进 `settings.json`（不是写死成启动参数），所以之后在界面里改设置、点「一键重启」依然生效。
+
+没有注册服务、或者当前身份没有安装权限时，`hmcsm --port 8800` 会**退化成独立后台进程**：同样是脱离终端的独立进程，关窗口不影响，但重启电脑后不会自动启动。终端里会明确提示这一点，以及怎么升级成真正的服务（`hmcsm install`）。
 
 启动器优先用 PATH 里的 `node`，找不到才退回安装时记录的绝对路径 —— 以后换 Node 版本、用 nvm 切版本都不会失效。
 
-> 如果已经把 HMCS 注册成开机自启的服务，就不需要 `hmcsm` 了（服务在后台一直跑着），直接开浏览器访问即可。此时再敲 `hmcsm` 会提示端口被占用 —— 这是固定端口的正常行为。
+> 如果已经把 HMCS 注册成开机自启的服务，`hmcsm --port` 走的是「改配置 + 重启服务」，不用手动 stop/start。
 
 > Linux 发行版源里的 `nodejs` 常常太旧（Ubuntu 20.04 是 10.19）。没有 root 的话，把官方二进制解到
 > `~/opt` 再软链到 `~/.local/bin` 就行，不必装系统包；JDK 同理（`~/opt/jdk-21`，HMCS 会自动扫到）。
@@ -211,11 +224,15 @@ node scripts/service.js install --dry-run  # 只打印将要写入的 unit / 计
 
 `sudo ./install-service.sh install` 会把服务装成系统级，但 **以调用 sudo 的那个用户身份运行**（脚本读 `SUDO_USER`），配置目录仍然落在你自己的家目录，不会凭空多出 `/root/.config/HMCS`。
 
-**端口和监听地址不在启动参数里**：安装时会把 `--port` / `--host` 写进 `settings.json`，`ExecStart` / 计划任务参数只留 `--log-file`（Windows 额外带 `--home`）。原因很实际 —— 命令行参数优先级高于配置文件，一旦写死，你在界面里改完设置、点了重启，还是会被告参数压回去，表现就是「设置保存了但永远不生效」。
+**端口和监听地址不在启动参数里**：安装时会把 `--port` / `--host` 写进 `settings.json`，`ExecStart` / 计划任务参数只留 `--log-file`。原因很实际 —— 命令行参数优先级高于配置文件，一旦写死，你在界面里改完设置、点了重启，还是会被老参数压回去，表现就是「设置保存了但永远不生效」。
+
+`--home` 只在两种情况出现：Windows（SYSTEM 账户的 `%APPDATA%` 与安装者不同）和设置了 `HMCS_HOME`（配置+数据合并到一个自定义目录）时。Linux / macOS 正常安装**不会**带它 —— 带上反而会把 `~/.local/share/HMCS` 并到 `~/.config/HMCS`，看着像「装完服务，实例和存档全不见了」。
 
 > **从 0.3.0 及更早版本升级上来**：旧的服务配置里写着 `--port` / `--host`，请**重新运行一次安装**（`安装服务.bat` 或 `./install-service.sh install`）让 unit / 计划任务换成新参数。重装会自动停掉旧实例、保留所有数据与实例。
 
-**停止是优雅的**：服务停止时不会直接 kill，而是先 `POST /api/system/shutdown`（用本机 `control.token` 鉴权），让 HMCS 依次给每个运行中的 Minecraft 发 `stop`、等它们把存档写完，再退出；systemd 的 `TimeoutStopSec=80` 和脚本里的 70 秒等待就是这个余量的来源。超时才强杀。
+**停止是优雅的**：Linux / macOS 走服务管理器自己的 `stop`（发 `SIGTERM`），HMCS 收到后逐个给运行中的 Minecraft 发 `stop`、等存档写完再退出，systemd 的 `TimeoutStopSec=80` 就是这个余量；Windows 的 `schtasks /End` 是强杀，所以先 `POST /api/system/shutdown`（用本机 `control.token` 鉴权）请它自己退，超时才 End。
+
+这里有个容易踩的坑：systemd 配的是 `Restart=always`（界面上的「一键重启」靠它拉起新进程），所以**不能让进程自己 `exit(0)` 来「停止」** —— 几秒后 systemd 又会把它拉回来，表现就是「点了停止，过一会儿又活了」。停止必须走 `systemctl stop`，让它被标记为「人为停止」。
 
 **Windows 的取舍**：Windows 没有免依赖的真·服务宿主（写 SCM 需要原生模块，NSSM / WinSW 要额外下载二进制）。这里用「计划任务 + SYSTEM」达到等价效果。因为 SYSTEM 的 `%APPDATA%` 和你的不同，脚本会用 `--home` 把数据目录钉死成安装者的配置目录，所以实例列表不会跑到 `C:\Windows\system32\config\systemprofile` 下面去。注意「关闭开机自启」在 Windows 上等于禁用该任务，此时手工 `start` 会临时启用、启动后自动恢复禁用。
 

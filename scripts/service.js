@@ -44,7 +44,7 @@ const IS_MAC = process.platform === 'darwin';
 
 // ------------------------------------------------------------------ 参数
 function parseArgs(argv) {
-  const o = { cmd: '', port: 0, host: '', autostart: true, scope: '', yes: false, dryRun: false };
+  const o = { cmd: '', port: 0, host: '', autostart: true, scope: '', yes: false, dryRun: false, json: false };
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -56,6 +56,8 @@ function parseArgs(argv) {
     else if (a === '--system') o.scope = 'system';
     else if (a === '--yes' || a === '-y') o.yes = true;
     else if (a === '--dry-run') o.dryRun = true;
+    // 给 hmcsm 之类的调用方用：只打一行 JSON，别掺人脸面话
+    else if (a === '--json') o.json = true;
     else if (!a.startsWith('-')) rest.push(a);
   }
   o.cmd = rest[0] || 'menu';
@@ -137,6 +139,46 @@ const SCOPE = IS_WIN
   ? 'machine'
   : (ARGS.scope || (typeof process.getuid === 'function' && process.getuid() === 0 ? 'system' : 'user'));
 
+// ------------------------------------------------------------------ 权限探测
+/** Windows 上 fltmc 需要管理员，非管理员返回 5；net session 依赖 Server 服务，只作兜底 */
+function isAdmin() {
+  if (IS_WIN) {
+    if (run('fltmc', []).code === 0) return true;
+    if (run('net', ['session']).code === 0) return true;
+    return false;
+  }
+  return typeof process.getuid === 'function' && process.getuid() === 0;
+}
+
+function canWriteDir(dir) {
+  try {
+    fs.accessSync(dir, fs.constants.W_OK);
+    return true;
+  } catch {
+    // 目录还不存在时看最近的已存在祖先
+    let cur = dir;
+    for (let i = 0; i < 12; i++) {
+      cur = path.dirname(cur);
+      if (cur === path.dirname(cur)) break;
+      if (fs.existsSync(cur)) {
+        try { fs.accessSync(cur, fs.constants.W_OK); return true; } catch { return false; }
+      }
+    }
+    return false;
+  }
+}
+
+/**
+ * 当前身份能不能真的把服务装上去。
+ * hmcsm 靠这个决定：无参数启动时是「交给服务管理器」还是「退化成独立后台进程」。
+ */
+function canInstall() {
+  if (IS_WIN) return isAdmin();
+  if (IS_MAC) return canWriteDir(path.dirname(MAC_PLIST));
+  // Linux：系统级要 root，用户级要能写 ~/.config/systemd/user
+  return SCOPE === 'system' ? isAdmin() : canWriteDir(UNIT_USER);
+}
+
 // ------------------------------------------------------------------ 输出
 const useColor = process.stdout.isTTY && (!IS_WIN || !!process.env.WT_SESSION || !!process.env.TERM_PROGRAM);
 const paint = (code, s) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -188,7 +230,23 @@ function runPrivileged(cmd, args) {
 }
 
 // ------------------------------------------------------------------ HTTP 探活 / 优雅停止
-function httpJson(pathname, { method = 'GET', token = '', timeout = 2500, body = null } = {}) {
+/**
+ * 探测端口候选。
+ *
+ * settings.json 里的端口不一定等于**正在跑**的端口：用户改完端口还没重启服务时，
+ * 进程还蹲在旧端口上。只认配置值的话，stop 会以为「没在运行」→ 直接 SIGKILL，
+ * Minecraft 存档就白写了。所以把 last-url.txt（程序启动时写的实际地址）也算上。
+ */
+function lastRunPort() {
+  try {
+    const u = fs.readFileSync(path.join(CONFIG_DIR, 'last-url.txt'), 'utf8').trim();
+    const m = u.match(/:(\d+)\/?$/);
+    return m ? Number(m[1]) : 0;
+  } catch { return 0; }
+}
+const PROBE_PORTS = [...new Set([PORT, lastRunPort()].filter(p => Number(p) > 0))];
+
+function httpJson(pathname, { method = 'GET', token = '', timeout = 2500, body = null, port = PORT } = {}) {
   return new Promise(resolve => {
     const headers = {};
     if (token) headers['X-HMCS-Control'] = token;
@@ -198,7 +256,7 @@ function httpJson(pathname, { method = 'GET', token = '', timeout = 2500, body =
       headers['Content-Type'] = 'application/json';
       headers['Content-Length'] = payload.length;
     }
-    const req = http.request({ host: '127.0.0.1', port: PORT, path: pathname, method, headers, timeout }, res => {
+    const req = http.request({ host: '127.0.0.1', port, path: pathname, method, headers, timeout }, res => {
       const chunks = [];
       res.on('data', ch => chunks.push(ch));
       res.on('end', () => {
@@ -219,23 +277,17 @@ function controlToken() {
   try { return fs.readFileSync(path.join(CONFIG_DIR, 'control.token'), 'utf8').trim(); } catch { return ''; }
 }
 
-async function isUp() {
-  const r = await httpJson('/api/system/ping', { timeout: 1200 });
-  return !!r.ok;
+/** 谁在应答就用谁：返回实际端口，都没有则 0 */
+async function livePort() {
+  for (const p of PROBE_PORTS) {
+    const r = await httpJson('/api/system/ping', { timeout: 900, port: p });
+    if (r.ok) return p;
+  }
+  return 0;
 }
 
-/** 先请 HMCS 自己优雅退出（会挨个给 Minecraft 发 stop），超时才硬杀 */
-async function gracefulStop(maxWaitSec = 70) {
-  if (!(await isUp())) return { wasUp: false, graceful: true };
-  say('正在请求 HMCS 优雅关闭（会先让 Minecraft 服务端保存并退出）…');
-  await httpJson('/api/system/shutdown', { method: 'POST', token: controlToken(), timeout: 5000 });
-  const deadline = Date.now() + maxWaitSec * 1000;
-  while (Date.now() < deadline) {
-    await sleep(700);
-    if (!(await isUp())) return { wasUp: true, graceful: true };
-  }
-  warn(`${maxWaitSec} 秒内没有完全退出，改用强制结束`);
-  return { wasUp: true, graceful: false };
+async function isUp() {
+  return (await livePort()) > 0;
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -250,10 +302,20 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
  * 安装时把 PORT / HOST 写进 settings.json，之后由程序自己读，
  * 界面改动 + 一键重启就能真正生效。
  */
+/**
+ * 要不要把配置目录钉进启动参数（--home）。
+ *
+ * Windows：服务跑在 SYSTEM 账户下，%APPDATA% 与安装者不同，必须钉死；
+ * 其它平台：只在用了 HMCS_HOME（配置+数据合并到同一个自定义目录）时才需要钉，
+ * 因为服务进程里没有这个环境变量。正常情况靠 XDG 自己就能算对 ——
+ * 乱钉反而会把 ~/.local/share/HMCS 并到 ~/.config/HMCS，
+ * 表现就是「装完服务，原来的实例和存档全不见了」。
+ */
+const PIN_HOME = IS_WIN || !!String(process.env.HMCS_HOME || '').trim();
+
 function execArgs() {
   const args = [APP, '--log-file'];
-  // Windows 服务跑在 SYSTEM 下，%APPDATA% 与安装者不同，必须把数据目录钉死
-  if (IS_WIN) args.push('--home', CONFIG_DIR);
+  if (PIN_HOME) args.push('--home', CONFIG_DIR);
   return args;
 }
 
@@ -330,9 +392,10 @@ const WIN = {
   },
   describe() {
     const st = WIN.state();
+    const can = canInstall();
     if (st === 'UNKNOWN') {
       return {
-        installed: false, running: false, autostart: false,
+        installed: false, running: false, autostart: false, canInstall: can,
         raw: '无法查询（PowerShell 与 schtasks 均不可用）',
         kind: `计划任务「${WIN_TASK}」（SYSTEM / 开机启动）`,
       };
@@ -341,6 +404,7 @@ const WIN = {
       installed: st !== 'MISSING',
       running: st === 'Running',
       autostart: st !== 'Disabled' && st !== 'MISSING',
+      canInstall: can,
       raw: st === 'MISSING' ? '未安装' : st,
       kind: `计划任务「${WIN_TASK}」（SYSTEM / 开机启动）`,
     };
@@ -378,7 +442,7 @@ function unitText() {
     `Environment=XDG_CONFIG_HOME=${home}/.config`,
     `Environment=XDG_DATA_HOME=${home}/.local/share`,
     `Environment=LANG=${process.env.LANG || 'C.UTF-8'}`,
-    `ExecStart=${NODE} ${APP} --log-file`,
+    `ExecStart=${NODE} ${APP} --log-file${PIN_HOME ? ' --home "' + CONFIG_DIR + '"' : ''}`,
     // 用 always 而不是 on-failure：界面上的「一键重启」在 systemd 下是主动 exit(0)，
     // 交给 systemd 拉起；on-failure 会把它当成正常退出，服务就再也不回来了。
     'Restart=always',
@@ -475,7 +539,7 @@ const LINUX = {
     const active = installed ? LINUX.active() : false;
     const enabled = installed ? LINUX.enabled() : false;
     return {
-      installed, running: active, autostart: enabled,
+      installed, running: active, autostart: enabled, canInstall: canInstall(),
       raw: installed ? `${active ? 'active' : 'inactive'} / ${enabled ? 'enabled' : 'disabled'}` : '未安装',
       kind: `systemd ${SCOPE === 'system' ? '系统服务' : '用户服务'}（${unitPath()}）`,
     };
@@ -488,6 +552,7 @@ const MAC_PLIST = path.join(OWNER.home, 'Library', 'LaunchAgents', `${MAC_LABEL}
 function plistText(runAtLoad = true) {
   const logs = path.join(LOG_DIR, 'launchd.log');
   const args = [NODE, APP, '--log-file'];
+  if (PIN_HOME) args.push('--home', CONFIG_DIR);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -561,7 +626,7 @@ const MAC = {
     const loaded = installed && MAC.loaded();
     const autostart = installed && MAC.enabled();
     return {
-      installed, running: loaded, autostart,
+      installed, running: loaded, autostart, canInstall: canInstall(),
       raw: installed ? (loaded ? '已加载' : '未加载') + (autostart ? ' / 开机自启' : ' / 不自启') : '未安装',
       kind: `launchd LaunchAgent（${MAC_PLIST}）`,
     };
@@ -573,7 +638,40 @@ const BACKEND = IS_WIN ? WIN : (IS_MAC ? MAC : LINUX);
 // ================================================================== 动作
 async function cmdStatus() {
   const d = BACKEND.describe();
-  const ping = await httpJson('/api/system/ping', { timeout: 1500 });
+  // 用「实际在跑的端口」探测，而不是配置里的端口：改完端口还没重启时两者不同
+  const live = await livePort();
+  const ping = { ok: live > 0 };
+  const info = ping.ok ? await httpJson('/api/system/info', { timeout: 2500, port: live }) : { ok: false };
+  const logFile = path.join(LOG_DIR, 'manager.log');
+
+  // --json：给 hmcsm 之类的调用方用，格式别乱改，只打一行
+  if (ARGS.json) {
+    say(JSON.stringify({
+      ok: true,
+      version: pkg.version,
+      port: PORT,
+      host: HOST,
+      livePort: live,
+      localOnly: LOCAL_ONLY,
+      serviceFile: SCOPE === 'system' ? UNIT_SYSTEM : SCOPE === 'user' ? UNIT_USER : IS_WIN ? WIN_TASK : MAC_PLIST,
+      installed: d.installed,
+      running: d.running,
+      autostart: d.autostart,
+      canInstall: !!d.canInstall,
+      kind: d.kind,
+      raw: d.raw,
+      up: ping.ok,
+      pid: info.ok ? info.data.pid : 0,
+      bind: info.ok ? info.data.bind || null : null,
+      urls: info.ok && Array.isArray(info.data.urls) ? info.data.urls : [],
+      authEnabled: !!(info.ok ? info.data.auth && info.data.auth.enabled : SETTINGS.auth && SETTINGS.auth.enabled),
+      configDir: CONFIG_DIR,
+      dataDir: DATA_DIR,
+      logFile: fs.existsSync(logFile) ? logFile : '',
+    }));
+    return;
+  }
+
   line();
   say(c.bold('  HMCS 服务状态'));
   line();
@@ -582,8 +680,10 @@ async function cmdStatus() {
   say('  运行      ' + (d.running ? c.green('运行中') : c.dim('未运行')) + c.dim('  (' + d.raw + ')'));
   say('  开机自启  ' + (d.autostart ? c.green('开启') : c.dim('关闭')));
   say('  监听      ' + HOST + ':' + PORT + (LOCAL_ONLY ? c.yellow('  （仅本机）') : ''));
+  if (live && live !== PORT) {
+    say('  实际在跑  ' + c.yellow('127.0.0.1:' + live) + c.dim('  （端口改过还没重启）'));
+  }
   if (ping.ok) {
-    const info = await httpJson('/api/system/info', { timeout: 2500 });
     if (info.ok) {
       const up = Number(info.data.uptimeSec || 0);
       say('  版本      v' + info.data.app + '  Node ' + info.data.node + '  PID ' + info.data.pid);
@@ -603,7 +703,7 @@ async function cmdStatus() {
   } else {
     say('  访问      ' + c.dim('127.0.0.1:' + PORT + ' 无应答'));
   }
-  say('  日志      ' + (fs.existsSync(path.join(LOG_DIR, 'manager.log')) ? path.join(LOG_DIR, 'manager.log') : c.dim('尚未生成')));
+  say('  日志      ' + (fs.existsSync(logFile) ? logFile : c.dim('尚未生成')));
   line();
 }
 
@@ -647,9 +747,9 @@ async function cmdInstall() {
   }
 
   if (before.installed) {    say(c.dim('  检测到已安装，先停止旧实例…'));
-    await gracefulStop(70);
-    BACKEND.hardStop();
-    await sleep(800);
+    // 走 cmdStop：systemd / launchd 下必须由服务管理器来停，
+    // 否则旧进程刚退出就被 Restart=always 拉回来，和新实例抢端口
+    await cmdStop();
   }
 
   const where = BACKEND.install();
@@ -742,7 +842,12 @@ async function safeStart() {
 async function cmdStart() {
   const d = BACKEND.describe();
   if (!d.installed) die('服务还没安装。先运行：node scripts/service.js install');
-  if (await isUp()) { warn('HMCS 已经在运行（127.0.0.1:' + PORT + '）'); return; }
+  const live = await livePort();
+  if (live) {
+    warn('HMCS 已经在运行（127.0.0.1:' + live + '）');
+    if (live !== PORT) say(c.dim('  但它监听的是旧端口，配置里已经是 ' + PORT + ' —— 用 restart 才能换过来。'));
+    return;
+  }
   await safeStart();
   for (let i = 0; i < 20; i++) {
     await sleep(500);
@@ -752,11 +857,43 @@ async function cmdStart() {
   process.exitCode = 1;
 }
 
+/** 等某个端口彻底不响应 */
+async function waitDown(port, maxWaitSec = 70) {
+  const deadline = Date.now() + maxWaitSec * 1000;
+  while (Date.now() < deadline) {
+    if (!(await httpJson('/api/system/ping', { timeout: 900, port })).ok) return true;
+    await sleep(700);
+  }
+  return false;
+}
+
 async function cmdStop() {
-  const r = await gracefulStop(70);
-  if (!r.wasUp) { warn('当前没有在运行'); BACKEND.hardStop(); return; }
-  if (!r.graceful) BACKEND.hardStop();
-  await sleep(600);
+  const d = BACKEND.describe();
+  const live = await livePort();
+  if (!d.installed && !live) { warn('当前没有在运行'); return; }
+
+  if (d.installed && !IS_WIN) {
+    // systemd 是 Restart=always、launchd 是 KeepAlive：让进程自己 exit(0) 的话，
+    // 服务管理器几秒后又把它拉起来，表现就是「点了停止，过一会儿又活了」。
+    // 所以这里必须走服务管理器自己的 stop（它发 SIGTERM，app 会据此优雅收尾）。
+    BACKEND.stop();
+  } else if (live) {
+    // Windows 计划任务没有重启策略，但 schtasks /End 是强杀。
+    // 先请它自己存盘退出（会挨个给 Minecraft 发 stop），超时才 End。
+    say('正在请求 HMCS 优雅关闭（会先让 Minecraft 服务端保存并退出）…');
+    await httpJson('/api/system/shutdown', { method: 'POST', token: controlToken(), timeout: 5000, port: live });
+  }
+
+  if (live && !(await waitDown(live, 70))) {
+    warn('70 秒内没有完全退出，强制结束');
+    BACKEND.hardStop();
+    await sleep(900);
+  }
+  if (await livePort()) {
+    bad('停止失败：端口仍在响应');
+    process.exitCode = 1;
+    return;
+  }
   ok('已停止');
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "hmcs-manager",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "HYCX MC Server Manager (HMCS) - 本地 Minecraft 服务端管理器（核心下载 / 进程托管 / WebUI 编辑 / 存档链接）",
   "main": "app.js",
   "scripts": {
