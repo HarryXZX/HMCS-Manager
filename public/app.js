@@ -1560,7 +1560,15 @@ async function viewSettings(i) {
           <select id="s-java"><option value="">自动选择</option>
             ${javaList.map(j => `<option value="${esc(j.path)}" ${s.javaPath === j.path ? 'selected' : ''}>Java ${j.major}（${esc(j.version)}）· ${esc(j.source)}</option>`).join('')}
           </select>
-          <div class="tip">当前探测到 ${javaList.length} 个运行时；Minecraft 26.x 需要 Java 25，1.21.x 需要 Java 21。</div>
+          <div class="tip">当前探测到 ${javaList.length} 个运行时；Minecraft 26.x 需要 Java 25，1.21.x 需要 Java 21。${javaList.some(j => j.major >= 25) ? '' : '本机还没有 Java 25：启动 26.x 实例时会自动下载一个，无需手动安装。'}</div>
+        </div>
+        <div class="form-row"><label>补齐 Java 运行时</label>
+          <div class="tip" style="margin-top:0">
+            <button class="btn" id="s-java-dl25">下载 Java 25（Temurin JRE）</button>
+            <button class="btn" id="s-java-dl21" style="margin-left:6px">下载 Java 21</button>
+            <span id="s-java-dlstate" class="faint" style="margin-left:6px"></span>
+          </div>
+          <div class="tip">下载到数据目录的 jvm/ 文件夹，之后会出现在上面的列表里；已在用或已存在时不会重复下载。</div>
         </div>
         <div class="form-row"><label>默认内存上限（-Xmx）</label><input id="s-mem" value="${esc(s.memory || '2G')}">
           <div class="tip">例如 2G / 4G；新建实例时的默认值</div></div>
@@ -1935,6 +1943,40 @@ async function viewSettings(i) {
     }
   };
 
+  // 手动补齐 Java：POST 后台跑，轮询 /api/java?force=1 拿进度
+  const dlState = $('#s-java-dlstate');
+  const startDl = async major => {
+    try {
+      await api('/api/java/ensure', { method: 'POST', body: { major } });
+      if (dlState) dlState.textContent = `Java ${major} 下载已开始……`;
+      const t0 = Date.now();
+      const poll = setInterval(async () => {
+        try {
+          const d = await api('/api/java?force=1');
+          const st = d.download || {};
+          if (st.running) {
+            const mb = n => (n / 1048576).toFixed(1);
+            dlState.textContent = st.phase === '下载中'
+              ? `下载中 ${mb(st.received)}MB${st.total ? ' / ' + mb(st.total) + 'MB' : ''}`
+              : (st.phase || '处理中') + '……';
+          } else {
+            clearInterval(poll);
+            if (st.error) { dlState.textContent = `下载失败：${st.error}`; return; }
+            dlState.textContent = '下载完成';
+            state.boot.java = d.java || [];
+            const sel = $('#s-java');
+            if (sel) sel.innerHTML = `<option value="">自动选择</option>` +
+              state.boot.java.map(j => `<option value="${esc(j.path)}">Java ${j.major}（${esc(j.version)}）· ${esc(j.source)}</option>`).join('');
+          }
+        } catch { /* 轮询失败下次再试 */ }
+        if (Date.now() - t0 > 15 * 60 * 1000) clearInterval(poll);
+      }, 2000);
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  const b25 = $('#s-java-dl25'), b21 = $('#s-java-dl21');
+  if (b25) b25.onclick = () => startDl(25);
+  if (b21) b21.onclick = () => startDl(21);
+
   $('#s-save').onclick = async () => {
     const btn = $('#s-save');
     btn.disabled = true;
@@ -2219,6 +2261,10 @@ async function openStartDialog() {
   if (!i) return;
   const javaList = state.boot.java || [];
   const needJava = String(i.mcVersion).startsWith('26') ? 25 : 21;
+  const javaOk = javaList.some(j => j.major >= needJava);
+  const dl = state.boot.javaDownload || {};
+  const dlTip = javaOk ? '' : `
+      <div class="tip warn">未检测到 Java ${needJava}+，点「启动服务端」会自动下载一个（Temurin，约 50MB）并继续启动，进度会显示在控制台。${dl.running ? '（当前已有下载任务进行中）' : ''}</div>`;
   const m = modal({
     title: '启动 · ' + i.name,
     wide: true,
@@ -2226,10 +2272,11 @@ async function openStartDialog() {
       <div class="form-2">
         <div class="form-row"><label>内存上限</label><input id="st-mem" value="${esc(i.memory || '2G')}"></div>
         <div class="form-row"><label>Java 运行时</label>
-          <select id="st-java"><option value="">自动（需 ${needJava}+）</option>
+          <select id="st-java"><option value="">自动${javaOk ? `（需 ${needJava}+）` : `（缺 Java ${needJava}，启动时自动下载）`}</option>
             ${javaList.map(j => `<option value="${esc(j.path)}">Java ${j.major} · ${esc(j.short || j.source)}</option>`).join('')}
           </select></div>
       </div>
+      ${dlTip}
       <div class="form-row"><label>额外 JVM 参数（可选）</label><input id="st-jvm" value="${esc(i.jvmArgs || '')}" placeholder="-XX:+UseG1GC"></div>
       <div class="form-row"><label>本次使用的世界</label>
         <div class="pick-list" id="st-worlds"><div class="muted" style="padding:10px">载入存档列表…</div></div>

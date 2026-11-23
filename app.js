@@ -414,6 +414,7 @@ register('GET', '/api/bootstrap', async (req, res) => {
     clientInfo: (settings.clientRoots || []).map(fsbrowse.describeRoot),
     extraInfo: (settings.extraWorldDirs || []).map(p => ({ path: path.resolve(p), exists: fs.existsSync(p) })),
     java: javaList,
+    javaDownload: java.taskStatus(),
     instances: list,
     providers: Object.entries(sources.PROVIDERS).map(([id, p]) => ({ id, label: p.label, note: p.note })),
     running: proc.runningIds(),
@@ -1246,7 +1247,19 @@ register('GET', '/api/sources/versions', async (req, res, p, q) => {
 });
 
 register('GET', '/api/java', async (req, res, p, q) => {
-  sendJson(res, 200, { java: await java.list(q.get('force') === '1') });
+  sendJson(res, 200, { java: await java.list(q.get('force') === '1'), download: java.taskStatus() });
+});
+
+// 手动触发补齐某个大版本的 Java（后台执行，进度看 GET /api/java 的 download 字段）
+register('POST', '/api/java/ensure', async (req, res) => {
+  const body = await readJson(req);
+  const major = Number(body.major) || 0;
+  if (major < 8 || major > 40) { const e = new Error('major 不合法'); e.status = 400; throw e; }
+  const st = java.taskStatus();
+  if (st.running) { sendJson(res, 200, { ok: true, already: true, download: st }); return; }
+  const p = java.ensureMajor(major, {}).catch(() => {}); // 后台跑，错误进 taskStatus().error
+  p.then?.(() => {}); // 保持引用，不 await
+  sendJson(res, 200, { ok: true, started: true, download: java.taskStatus() });
 });
 
 register('PUT', '/api/settings', async (req, res) => {
