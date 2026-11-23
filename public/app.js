@@ -641,9 +641,14 @@ async function viewConfig(i) {
   const list = await api(`/api/instances/${i.id}/config/list`);
   const eulaItem = list.files.find(f => f.kind === 'eula') || { file: 'eula.txt', exists: false, kind: 'eula', accepted: false };
   const items = [{ file: 'server.properties', exists: true, kind: 'props' }, ...list.files.filter(f => f.kind !== 'eula')];
+  // props 表单分支认的是哨兵值 'props'，而早期版本侧栏按钮用的是文件名
+  // 'server.properties'。点一下就会掉进 YAML 文件树：js-yaml 把整个文件读成
+  // 一个长字符串，表单控件全没了，点「重载」也一直回不来。统一归一化。
+  if (state.cfgTarget === 'server.properties') state.cfgTarget = 'props';
   if (state.cfgTarget !== 'props' && state.cfgTarget !== 'eula.txt' && !items.some(f => f.file === state.cfgTarget)) state.cfgTarget = 'props';
 
-  const nav = items.map(f => `<button data-cfg="${esc(f.file)}" class="${state.cfgTarget === f.file ? 'active' : ''}">
+  const targetOf = f => (f.kind === 'props' ? 'props' : f.file);
+  const nav = items.map(f => `<button data-cfg="${esc(targetOf(f))}" class="${state.cfgTarget === targetOf(f) ? 'active' : ''}">
       ${esc(f.file)}${f.exists ? '' : ' <span class="faint">·未生成</span>'}</button>`).join('');
   const navEula = `<button data-cfg="eula.txt" class="${state.cfgTarget === 'eula.txt' ? 'active' : ''}">
       eula.txt <span class="chip ${eulaItem.accepted ? 'green' : ''}" style="margin-left:4px">${eulaItem.accepted ? '已同意' : '未同意'}</span></button>`;
@@ -662,7 +667,8 @@ async function viewConfig(i) {
     </div>`;
 
   $$('[data-cfg]').forEach(b => b.onclick = () => {
-    state.cfgTarget = b.dataset.cfg;
+    // 兼容旧 DOM / 旧状态：文件名一律落回 props 表单
+    state.cfgTarget = b.dataset.cfg === 'server.properties' ? 'props' : b.dataset.cfg;
     if (state.cfgTarget !== 'props') state.cfgFile = state.cfgTarget;
     renderView();
   });
@@ -760,7 +766,7 @@ async function renderEula(i) {
       </div>`;
 
     $('#eu-raw').onclick = () => { textMode = true; paint(); };
-    $('#eu-reload').onclick = () => renderView();
+    $('#eu-reload').onclick = () => renderEula(i);
     $('#eu-save').onclick = async () => {
       const want = $('#eu-check').checked;
       if (!want && !on) { toast('未勾选，无需保存'); return; }
@@ -813,6 +819,8 @@ async function renderPropsForm(i) {
       <input id="cfg-search" placeholder="搜索配置项…" style="width:240px">
       <div style="flex:1"></div>
       <span class="faint" style="font-size:12px">${data.exists ? '' : '文件尚不存在，保存后会生成'}</span>
+      <button class="btn sm ghost" id="cfg-raw">文本模式</button>
+      <button class="btn sm ghost" id="cfg-reload">重载</button>
       <button class="btn primary" id="cfg-save">保存</button>
     </div>
     ${sections}
@@ -827,6 +835,9 @@ async function renderPropsForm(i) {
       el.style.display = !q || el.dataset.fkey.toLowerCase().includes(q) || el.textContent.toLowerCase().includes(q) ? '' : 'none';
     });
   };
+  // 文本模式仍可用（原文编辑），但保存后回到表单，不会「降级回不去」
+  $('#cfg-raw').onclick = () => rawEditor(i, 'server.properties', data.raw);
+  $('#cfg-reload').onclick = () => renderPropsForm(i);
   $('#cfg-save').onclick = async () => {
     const values = {};
     $$('[data-k]').forEach(el => {
@@ -836,11 +847,16 @@ async function renderPropsForm(i) {
     try {
       await api(`/api/instances/${i.id}/config/properties`, { method: 'PUT', body: { values } });
       toast('server.properties 已保存'); refresh(true); renderTopbar();
+      // 重新读一遍表单，界面显示的必须是刚写进文件的值
+      await renderPropsForm(i);
     } catch (e) { toast(e.message, 'err'); }
   };
 }
 
 async function renderFileConfig(i, file) {
+  // .properties 有专用表单。万一被当成 YAML 文件树，js-yaml 会把整个文件
+  // 读成一个长字符串 → 表单控件全消失，保存还会用 yaml.dump 把文件毁掉。
+  if (/\.properties$/i.test(file)) { state.cfgTarget = 'props'; return renderPropsForm(i); }
   const data = await api(`/api/instances/${i.id}/config/file?file=${encodeURIComponent(file)}`);
   state.cfgKind = data.kind;
   state.cfgFile = file;
@@ -863,6 +879,20 @@ async function renderFileConfig(i, file) {
     $('#cfg-rawmode').onclick = () => rawEditor(i, file, data.raw);
     return;
   }
+  // 空文件 / 纯文本 / 解析成一整个标量的 YAML：没有 key-value 结构，
+  // 表单树画不出来，也不该让人「保存」把原文覆盖掉
+  if (data.data === null || typeof data.data !== 'object') {
+    $('#cfg-main').innerHTML = `<div class="card" style="border-color:#4a2020">
+        <b>无法用表单编辑</b>
+        <div class="hint">${esc(file)} 没有解析出对象或数组结构${data.error ? '：' + esc(data.error) : ''}。请用文本模式编辑原文。</div>
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          <button class="btn" id="cfg-rawmode">改用文本编辑</button>
+          <button class="btn ghost" id="cfg-backprops">返回 server.properties 表单</button>
+        </div></div>`;
+    $('#cfg-rawmode').onclick = () => rawEditor(i, file, data.raw);
+    $('#cfg-backprops').onclick = () => { state.cfgTarget = 'props'; renderView(); };
+    return;
+  }
 
   $('#cfg-main').innerHTML = `
     <div class="filebar">
@@ -878,7 +908,8 @@ async function renderFileConfig(i, file) {
 
   renderTree($('#cfg-tree'), state.cfgData, []);
   $('#cfg-raw').onclick = () => rawEditor(i, file, state.cfgRaw);
-  $('#cfg-reload').onclick = () => renderView();
+  // 只重读当前文件，不整页 renderView（避免状态漂移导致「重载没反应」）
+  $('#cfg-reload').onclick = () => renderFileConfig(i, file);
   $('#cfg-save').onclick = async () => {
     try {
       await api(`/api/instances/${i.id}/config/file`, { method: 'PUT', body: { file, data: state.cfgData } });

@@ -667,20 +667,32 @@ register('GET', '/api/instances/:id/config/file', async (req, res, p, q) => {
   instOf(p.id);
   const rel = q.get('file');
   const abs = fsx.safeResolve(dirOf(p.id), rel);
-  if (!fs.existsSync(abs)) return sendJson(res, 200, { file: rel, exists: false, raw: '', data: null, kind: rel.endsWith('.json') ? 'json' : 'yaml' });
+  const isProps = /\.properties$/i.test(rel);
+  const kind = isProps ? 'props' : (rel.endsWith('.json') ? 'json' : 'yaml');
+  if (!fs.existsSync(abs)) return sendJson(res, 200, { file: rel, exists: false, raw: '', data: null, error: '', kind });
   const raw = fs.readFileSync(abs, 'utf8');
   let data = null, error = '';
-  try { data = rel.endsWith('.json') ? JSON.parse(raw) : yaml.load(raw); } catch (e) { error = e.message; }
-  sendJson(res, 200, { file: rel, exists: true, raw, data, error, kind: rel.endsWith('.json') ? 'json' : 'yaml' });
+  if (isProps) {
+    // server.properties 不是 YAML：js-yaml 会把整个文件读成一个长字符串，
+    // 表单树因此一个控件都画不出来，保存还会用 yaml.dump 把原文毁掉。
+    // 只把原文交给文本模式，结构化表单走 /config/properties。
+    error = 'server.properties 不是 YAML/JSON，请走专用表单（配置 → server.properties），或用文本模式编辑原文';
+  } else {
+    try { data = rel.endsWith('.json') ? JSON.parse(raw) : yaml.load(raw); } catch (e) { error = e.message; }
+  }
+  sendJson(res, 200, { file: rel, exists: true, raw, data, error, kind });
 });
 
 register('PUT', '/api/instances/:id/config/file', async (req, res, p) => {
   instOf(p.id);
   const body = await readJson(req);
+  const isProps = /\.properties$/i.test(body.file);
   const abs = fsx.safeResolve(dirOf(p.id), body.file);
   let out = '';
-  if (typeof body.raw === 'string' && body.raw.length) out = body.raw;
+  // 文本模式（raw）对 .properties 合法；结构化写入（data）不合法
+  if (typeof body.raw === 'string') out = body.raw;
   else if (body.data !== undefined) {
+    if (isProps) throw new Error('server.properties 不能按 YAML/JSON 结构保存，请用专用表单或文本模式');
     out = body.file.endsWith('.json')
       ? JSON.stringify(body.data, null, 2)
       : yaml.dump(body.data, { lineWidth: 140, noRefs: true, sortKeys: false });
