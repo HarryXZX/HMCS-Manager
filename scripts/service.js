@@ -289,8 +289,13 @@ const WIN = {
     // 禁用状态下无法手动运行：临时启用，跑起来后再恢复禁用（禁用不影响已在运行的实例）
     if (wasDisabled) run('schtasks', ['/Change', '/TN', WIN_TASK, '/ENABLE']);
     const r = run('schtasks', ['/Run', '/TN', WIN_TASK]);
-    if (wasDisabled) setTimeout(() => run('schtasks', ['/Change', '/TN', WIN_TASK, '/DISABLE']), 4000).unref();
-    if (r.code !== 0) throw new Error(r.err || r.out || '启动失败');
+    if (r.code !== 0) {
+      if (wasDisabled) run('schtasks', ['/Change', '/TN', WIN_TASK, '/DISABLE']);
+      throw new Error(r.err || r.out || '启动失败');
+    }
+    // 注意不能 unref：否则命令结束后进程立刻退出，这个「恢复禁用」永远不执行，
+    // 结果就是「关掉自启」被一次手工启动悄悄改回「开」。
+    if (wasDisabled) setTimeout(() => run('schtasks', ['/Change', '/TN', WIN_TASK, '/DISABLE']), 4000);
   },
 
   hardStop() {

@@ -8,11 +8,20 @@ chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 
-rem --- request administrator rights (SCHTASKS /RU SYSTEM needs elevation) ---
-net session >nul 2>&1
-if errorlevel 1 (
+rem --- admin check: net session needs the Server service running, fltmc is a fallback
+set "HMCS_ADMIN="
+net session >nul 2>&1 && set "HMCS_ADMIN=1"
+if not defined HMCS_ADMIN (
+  fltmc >nul 2>&1 && set "HMCS_ADMIN=1"
+)
+
+if not defined HMCS_ADMIN (
   echo Requesting administrator privileges...
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
+  if "%~1"=="" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+  ) else (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
+  )
   exit /b
 )
 
