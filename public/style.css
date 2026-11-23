@@ -11,6 +11,9 @@ body{
   margin:0;background:var(--bg);color:var(--text);
   font:14px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
   overflow:hidden;
+  -webkit-text-size-adjust:100%;
+  -webkit-tap-highlight-color:transparent;
+  overscroll-behavior:none;
 }
 button{font:inherit;color:inherit;cursor:pointer}
 input,select,textarea{font:inherit;color:var(--text);background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;outline:none}
@@ -19,7 +22,27 @@ input:focus,select:focus,textarea:focus{border-color:var(--blue)}
 ::-webkit-scrollbar-thumb{background:#243040;border-radius:6px}
 ::-webkit-scrollbar-track{background:transparent}
 
-#app{display:flex;height:100vh}
+/* 100dvh：移动浏览器地址栏收起 / 展开时视口会变，vh 按「最大的那个」算，
+   底部会有一截跑到屏幕外（弹窗按钮点不到就是这个原因）。dvh 跟着实际视口走。 */
+#app{position:relative;display:flex;height:100vh;height:100dvh}
+
+/* ---------- 移动端控件 ---------- */
+.icon-btn{
+  display:none;align-items:center;justify-content:center;width:38px;height:38px;flex:0 0 38px;
+  border:1px solid var(--line-2);background:#141c26;border-radius:9px;font-size:18px;line-height:1;
+}
+.icon-btn:active{background:#1a2532}
+.icon-btn .bars,.icon-btn .bars::before,.icon-btn .bars::after{
+  display:block;width:16px;height:2px;border-radius:2px;background:currentColor;content:"";
+}
+.icon-btn .bars{position:relative}
+.icon-btn .bars::before{position:absolute;top:-5px;left:0}
+.icon-btn .bars::after{position:absolute;top:5px;left:0}
+#sidebar-mask{display:none;position:fixed;inset:0;background:rgba(3,6,9,.6);z-index:19;backdrop-filter:blur(1px)}
+#sidebar-mask.on{display:block}
+
+/* 宽表格在窄屏上横向滚动，不挤压（外层 .tbl-wrap 才滚，桌面无影响） */
+.tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain}
 
 /* ---------- 侧栏 ---------- */
 #sidebar{
@@ -225,8 +248,143 @@ tr:hover .act{opacity:1}
 @keyframes in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .spin{width:14px;height:14px;border:2px solid #2c3a4a;border-top-color:var(--accent);border-radius:50%;display:inline-block;animation:sp .7s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
-@media(max-width:900px){
-  #sidebar{position:absolute;z-index:20;height:100%;transform:translateX(-100%);transition:.2s}
+/* ---------- 触屏（没有 hover）：删除 / 行内操作按钮常显 ---------- */
+@media (hover:none){
+  .inst-item .inst-del{opacity:1;width:30px;height:30px;font-size:17px}
+  .act{opacity:1;gap:6px}
+  tr:hover td{background:transparent}
+  .cfg-nav button:hover,.dir-item:hover,.pick:hover{background:none}
+}
+
+/* ---------- 窄屏（手机 / 竖屏平板） ---------- */
+@media (max-width:820px){
+  /* 侧栏改成抽屉，配汉堡按钮 + 遮罩 */
+  #sidebar{
+    position:fixed;top:0;bottom:0;left:0;z-index:20;
+    width:min(86vw,320px);height:auto;
+    transform:translateX(-100%);transition:transform .2s ease;
+    box-shadow:0 0 40px rgba(0,0,0,.5);
+    padding-top:env(safe-area-inset-top);
+    padding-bottom:env(safe-area-inset-bottom);
+  }
   #sidebar.open{transform:none}
+  .icon-btn{display:inline-flex}
+  .brand{padding:12px 12px 10px;gap:8px}
+  .brand .mark{width:26px;height:26px;font-size:12px}
+  .brand b{font-size:14px}
+  .brand span{font-size:10.5px}
+  #sidebar-close{margin-left:auto;border-color:transparent;background:transparent;color:var(--muted);font-size:22px;width:32px;height:32px;flex-basis:32px}
+  .inst-item{padding:11px 10px}
+  .inst-item .nm{font-size:14px}
+  .inst-item .sub{font-size:11.5px}
+  .sidebar-foot .btn{min-height:44px}
+
+  /* 顶栏：一行「菜单 + 标题 + 启停」，状态 chip 单独一行横向滚 */
+  #topbar{flex-wrap:wrap;gap:8px;padding:8px 12px;padding-top:calc(8px + env(safe-area-inset-top))}
+  .tb-head{flex:1;min-width:0}
+  #topbar .title{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #topbar .sub{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #topbar .spacer{display:none}
+  #tb-actions{order:2;display:flex;gap:6px;flex:0 0 auto}
+  #tb-chips{order:3;flex:1 0 100%;display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:2px;scrollbar-width:none}
+  #tb-chips::-webkit-scrollbar{display:none}
+  #tb-chips:empty{display:none}
+  #tb-actions .btn{min-height:40px;min-width:64px;justify-content:center}
+
+  /* 页签横向滚 */
+  .tabs{padding:0 6px;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+  .tabs::-webkit-scrollbar{display:none}
+  .tab{padding:12px 11px;font-size:13px}
+
+  #view{padding:12px 12px calc(18px + env(safe-area-inset-bottom))}
+  .section{margin-bottom:18px}
+  .section-head{flex-wrap:wrap;gap:6px;margin-bottom:8px}
+  .section-head .desc{font-size:11.5px}
+
+  /* 窄窗口（哪怕有鼠标）也把 hover 才出现的操作按钮常显 */
+  .inst-item .inst-del{opacity:1;width:30px;height:30px;font-size:17px}
+  .act{opacity:1;gap:6px}
+
+  /* 卡片与表单 */
+  .card{padding:12px}
+  .card .big,.mono,.kv-box,.list-row .nm{overflow-wrap:anywhere;word-break:break-word}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}
+  /* 窄窗口（哪怕有鼠标）也把 hover 才出现的操作按钮常显 */
+  .form-2{grid-template-columns:1fr;gap:0}
+  .field{grid-template-columns:1fr;gap:5px;padding:10px 0}
+  .field label{font-size:13px}
+  .field .ctl input[type=text],.field .ctl input[type=number],.field .ctl select{max-width:none}
+  .tree-row{flex-wrap:wrap}
+  .tree-key{flex:1 0 100%;padding-top:0}
+  .tree-val{flex:1 0 100%}
+  .kv-box>div{flex-wrap:wrap}
   .cfg-layout{grid-template-columns:1fr}
+  .cfg-nav{position:static;display:flex;gap:4px;overflow-x:auto;padding:4px;scrollbar-width:none}
+  .cfg-nav::-webkit-scrollbar{display:none}
+  .cfg-nav button{width:auto;white-space:nowrap;padding:8px 10px}
+  .cfg-nav .grp{display:none}
+
+  /* 横排控件换行，别把输入框挤成一条线 */
+  .path-row,.dirbar,.filebar{flex-wrap:wrap}
+  .path-row input,.dirbar input{flex:1 1 100%}
+  .path-row .btn,.dirbar .btn{flex:1 1 auto;justify-content:center}
+  .list-row{flex-wrap:wrap;align-items:flex-start}
+  .list-row .li-main{flex:1 1 100%}
+
+  /* iOS 上输入框字号 <16px 会在聚焦时自动放大页面 */
+  input,select,textarea,
+  .path-row input,.dirbar input,
+  .form-row input,.form-row select,.form-row textarea,
+  .console-input input,.field .ctl input,.field .ctl select{font-size:16px}
+  .editor{font-size:16px;height:38dvh}
+
+  /* 点按目标至少 40px，手指才点得准 */
+  .btn{min-height:40px;padding:8px 14px}
+  .btn.sm{min-height:34px;padding:7px 10px}
+  .btn.block{min-height:44px}
+  .switch input{width:20px;height:20px}
+
+  /* 宽表格横向滚动，不挤压 */
+  .tbl-wrap>table{min-width:560px}
+  th,td{padding:9px 8px}
+  td .mono{word-break:break-all}
+
+  .plug-grid{grid-template-columns:1fr}
+  .console-wrap{height:calc(100dvh - 250px);min-height:260px}
+  #console{font-size:12px}
+  .save-bar{padding:12px 0 calc(12px + env(safe-area-inset-bottom));gap:8px;background:var(--bg);border-top:1px solid var(--line);margin-top:8px}
+  .save-bar .btn{min-width:132px}
+
+  /* 弹窗改成底部抽屉：内容再长，操作按钮也贴在拇指够得到的地方，
+     留出安全区，不会被浏览器工具栏 / 小白条盖住 */
+  #modal-root{padding:0;align-items:end}
+  .modal{width:100%;max-width:100%;max-height:92dvh;border-radius:16px 16px 0 0;border-bottom:0}
+  .modal.wide{width:100%}
+  .modal-head{padding:12px 14px}
+  .modal-body{padding:14px;overscroll-behavior:contain}
+  .modal-foot{
+    padding:10px 14px calc(10px + env(safe-area-inset-bottom));
+    gap:10px;background:var(--panel);
+  }
+  .modal-foot .btn{flex:1 1 0;justify-content:center;min-height:46px;font-size:14px}
+  .pick-list{max-height:38dvh}
+  .form-row label{font-size:13px}
+
+  #toast{left:10px;right:10px;bottom:calc(10px + env(safe-area-inset-bottom));align-items:stretch}
+  .toast{max-width:none}
+}
+
+/* 小屏手机再收一点 */
+@media (max-width:380px){
+  #topbar .title{font-size:14px}
+  #tb-actions .btn{min-width:56px;padding:8px 10px}
+  .tab{padding:11px 9px;font-size:12.5px}
+  .grid{grid-template-columns:1fr 1fr}
+  .modal-foot .btn{font-size:13.5px}
+}
+
+/* 横屏矮屏：弹窗别顶到天花板，控制台别被压没 */
+@media (max-height:520px){
+  .modal{max-height:96dvh}
+  .console-wrap{height:calc(100dvh - 150px)}
 }

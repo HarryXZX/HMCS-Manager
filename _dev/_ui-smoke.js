@@ -24,6 +24,7 @@ function mkEl(tag) {
     onclick: null, onchange: null, onkeydown: null, oninput: null,
     appendChild(c) { this.children.push(c); return c; },
     remove() {}, focus() {}, blur() {}, click() { if (this.onclick) return this.onclick({ target: this, stopPropagation() {}, preventDefault() {} }); },
+    setAttribute(k, v) { this[k] = String(v); },
     addEventListener() {}, removeEventListener() {},
     querySelector(s) { return mkEl(s); },
     querySelectorAll() { return []; },
@@ -92,6 +93,9 @@ const sandbox = {
     return r;
   },
   alert: () => {},
+  addEventListener() {},
+  innerWidth: 1440,
+  innerHeight: 900,
   confirm: () => true,
   prompt: () => 'x',
 };

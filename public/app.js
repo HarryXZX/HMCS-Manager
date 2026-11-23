@@ -295,11 +295,31 @@ function renderSidebar() {
     state.filesPath = ''; state.cfgTarget = 'props'; state.cfgFile = '';
     disconnectConsole();
     render();
+    setSidebarOpen(false);   // 手机上选完就收起抽屉
   });
   $$('#inst-list [data-del]').forEach(b => b.onclick = e => {
     e.stopPropagation();
     deleteInstance(b.dataset.del);
   });
+}
+
+/**
+ * 手机端侧栏是抽屉（CSS 在 max-width:820px 里把它挪出屏幕），
+ * 这里只负责开合与遮罩；桌面上这些 class 不起作用，无副作用。
+ */
+function setSidebarOpen(open) {
+  const side = $('#sidebar');
+  const mask = $('#sidebar-mask');
+  if (!side) return;
+  side.classList.toggle('open', !!open);
+  if (mask) mask.classList.toggle('on', !!open);
+  const menu = $('#menu-btn');
+  if (menu && typeof menu.setAttribute === 'function') menu.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function closeSidebar() {
+  const side = $('#sidebar');
+  if (side && side.classList.contains('open')) setSidebarOpen(false);
 }
 
 function renderTabs() {
@@ -548,7 +568,7 @@ async function viewFiles(i) {
       <span class="faint" style="font-size:12px">${data.entries.length} 项</span>
     </div>
     <div class="crumbs">${crumbs.join(' ')}</div>
-    <div class="card" style="padding:0;overflow:hidden">
+    <div class="card tbl-wrap" style="padding:0">
       <table>
         <thead><tr><th></th><th>名称</th><th class="right">大小</th><th>修改时间</th><th></th></tr></thead>
         <tbody>${rows || `<tr><td colspan="5" class="faint" style="padding:22px;text-align:center">空目录</td></tr>`}</tbody>
@@ -990,7 +1010,7 @@ async function viewPlugins(i) {
     </div>
     <div class="section">
       <div class="section-head"><h2>已安装</h2><div class="desc">${esc(inst2.dir)}/ · ${inst2.items.length} 个</div></div>
-      <div class="card" style="padding:0"><table>
+      <div class="card tbl-wrap" style="padding:0"><table>
         <thead><tr><th>文件</th><th class="right">大小</th><th>时间</th><th></th></tr></thead>
         <tbody>${inst2.items.map(f => `<tr><td class="mono">${esc(f.name)}</td><td class="right mono faint">${fmtSize(f.size)}</td>
           <td class="mono faint">${fmtTime(f.mtime)}</td>
@@ -1093,7 +1113,7 @@ async function viewWorld(i) {
 
     <div class="section">
       <div class="section-head"><h2>本机已有存档</h2><div class="desc">来自客户端实例 / 版本隔离目录，可直接链接，不必拷贝</div></div>
-      <div class="card" style="padding:0;overflow:auto">
+      <div class="card tbl-wrap" style="padding:0">
         <table>
           <thead><tr><th>世界</th><th>版本</th><th>来源</th><th class="right">大小</th><th>修改时间</th><th></th></tr></thead>
           <tbody>${data.worlds.map(w => `
@@ -1269,7 +1289,7 @@ async function viewNetwork(i) {
     <div class="section">
       <div class="section-head"><h2>网关端口映射表</h2>
         <div class="desc">${st.mappingError ? esc(st.mappingError) : '只读，最多显示 40 条；删除会直接改动路由器配置'}</div></div>
-      <div class="card" style="padding:0;overflow:auto">
+      <div class="card tbl-wrap" style="padding:0">
         <table>
           <thead><tr><th>协议</th><th>外网端口</th><th>内网目标</th><th>描述</th><th>租期</th><th></th></tr></thead>
           <tbody>${rows || `<tr><td colspan="6" class="faint" style="padding:20px;text-align:center">${gw ? '网关没有返回映射表（部分型号不支持读取）' : '需要先检测到网关'}</td></tr>`}</tbody>
@@ -2245,6 +2265,9 @@ async function openStartDialog() {
     const btn = $('#st-ok', m.root);
     if (!$('#st-eula', m.root).checked && !i.eula?.accepted) {
       toast('需要先勾选同意 Minecraft EULA 才能启动', 'err');
+      // 手机上按钮在底部、EULA 勾选框在上面，滚过去让人看见到底缺什么
+      const row = $('#st-eula', m.root).closest ? $('#st-eula', m.root).closest('.form-row') : null;
+      if (row && typeof row.scrollIntoView === 'function') row.scrollIntoView({ block: 'center', behavior: 'smooth' });
       return;
     }
     btn.disabled = true;
@@ -2273,11 +2296,30 @@ async function openStartDialog() {
 }
 
 // ---------------------------------------------------------------- 事件绑定
-$('#btn-new').onclick = openNewDialog;
-$('#btn-import').onclick = openImportDialog;
+$('#btn-new').onclick = () => { closeSidebar(); openNewDialog(); };
+$('#btn-import').onclick = () => { closeSidebar(); openImportDialog(); };
+
+// 手机端侧栏抽屉：汉堡按钮开，遮罩 / 关闭按钮 / 选完实例关
+const menuBtn = $('#menu-btn');
+if (menuBtn) menuBtn.onclick = () => {
+  const side = $('#sidebar');
+  setSidebarOpen(!(side && side.classList.contains('open')));
+};
+const sidebarClose = $('#sidebar-close');
+if (sidebarClose) sidebarClose.onclick = closeSidebar;
+const sidebarMask = $('#sidebar-mask');
+if (sidebarMask) sidebarMask.onclick = closeSidebar;
+// 转屏 / 拉宽窗口后别留个遮罩盖住页面
+if (typeof window.addEventListener === 'function') {
+  window.addEventListener('resize', () => { if (window.innerWidth > 820) closeSidebar(); });
+}
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { const root = $('#modal-root'); if (root.classList.contains('on')) { root.classList.remove('on'); root.innerHTML = ''; } }
+  if (e.key === 'Escape') {
+    const root = $('#modal-root');
+    if (root.classList.contains('on')) { root.classList.remove('on'); root.innerHTML = ''; return; }
+    closeSidebar();
+  }
 });
 
 (async function main() {

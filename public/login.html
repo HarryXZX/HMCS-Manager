@@ -2,7 +2,8 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
 <meta name="robots" content="noindex,nofollow">
 <title>登录 · HMCS Manager</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233fb950'/%3E%3Cpath d='M9 22V10h3.2v4.6h6.6V10H22v12h-3.2v-4.6h-6.6V22z' fill='%23071409'/%3E%3C/svg%3E">
@@ -16,10 +17,12 @@
   html,body{height:100%}
   body{
     margin:0;display:grid;place-items:center;padding:24px;
+    padding:calc(24px + env(safe-area-inset-top)) 20px calc(24px + env(safe-area-inset-bottom));
     background:
       radial-gradient(900px 420px at 50% -10%, rgba(63,185,80,.10), transparent 70%),
       var(--bg);
     color:var(--text);font:14px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    -webkit-text-size-adjust:100%;-webkit-tap-highlight-color:transparent;
   }
   .wrap{width:100%;max-width:372px}
   .brand{display:flex;align-items:center;gap:10px;margin-bottom:22px}
@@ -32,13 +35,14 @@
   .sub{margin:0 0 16px;font-size:12.5px;color:var(--muted)}
   label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
   input[type=password],input[type=text]{
-    width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line);
-    background:#0e141c;color:var(--text);font:inherit;outline:none;
+    width:100%;padding:12px 12px;border-radius:9px;border:1px solid var(--line);
+    background:#0e141c;color:var(--text);font:inherit;font-size:16px;outline:none;
   }
   input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(63,185,80,.14)}
   button{
-    width:100%;margin-top:14px;padding:10px 12px;border-radius:9px;border:1px solid #1f6f36;
-    background:var(--accent);color:#06120a;font:inherit;font-weight:600;cursor:pointer;
+    width:100%;margin-top:14px;padding:13px 12px;border-radius:9px;border:1px solid #1f6f36;
+    background:var(--accent);color:#06120a;font:inherit;font-weight:600;font-size:15px;cursor:pointer;
+    min-height:48px;
   }
   button:hover{filter:brightness(1.06)}
   button:disabled{opacity:.6;cursor:not-allowed;filter:none}
