@@ -1,12 +1,13 @@
 {
   "name": "hmcs-manager",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "HYCX MC Server Manager (HMCS) - 本地 Minecraft 服务端管理器（核心下载 / 进程托管 / WebUI 编辑 / 存档链接）",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
     "service": "node scripts/service.js",
-    "reset-password": "node scripts/reset-password.js"
+    "reset-password": "node scripts/reset-password.js",
+    "icons": "node scripts/make-icons.js"
   },
   "keywords": ["minecraft", "server", "paper", "fabric", "webui", "launcher"],
   "author": "HYCX",

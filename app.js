@@ -64,6 +64,7 @@ logger.init({ toFile: ARGS.logFile || !process.stdout.isTTY });
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.woff2': 'font/woff2', '.map': 'application/json',
 };
 
@@ -1355,7 +1356,7 @@ register('GET', '/api/clients', async (req, res, p, q) => {
 });
 
 // ------------------------------------------------------------------ 静态资源
-const STATIC_ALLOW = new Set(['.html', '.css', '.js', '.svg', '.png', '.ico', '.woff2', '.map']);
+const STATIC_ALLOW = new Set(['.html', '.css', '.js', '.svg', '.png', '.ico', '.webmanifest', '.woff2', '.map']);
 
 function serveStatic(req, res, pathname) {
   const rel = pathname === '/' ? '/index.html' : (pathname === '/login' ? '/login.html' : pathname);

@@ -21,10 +21,13 @@
                       auth（密码/会话/限流）/ selfmap（自身端口映射）/ logger（日志落盘）
                       firewall（跨平台防火墙放行 / 收回）
   public/             前端（原生 JS，无构建）；login.html 是独立的登录页
+                      brand/HYCX-MC.png 是品牌源图；favicon.ico / icon-*.png /
+                      apple-touch-icon.png / manifest.webmanifest 是站点图标
   scripts/            hmcsm.js（命令行入口）/ menu.js（命令行控制台）/ service.js（服务注册与管理）
                       firewall-cli.js（防火墙）/ install-cli.js（写 PATH）/ launch.js（脱离终端启动）
-                      prompt.js（终端输入）/ reset-password.js（重置密码）
-  _dev/               自测脚本（UPnP 网关、认证、hmcsm、防火墙、公网地址、前端冒烟、重启/换端口生效），可整个删除
+                      prompt.js（终端输入）/ make-icons.js（由源图生成全套图标）
+                      reset-password.js（重置密码）
+  _dev/               自测脚本（UPnP 网关、认证、hmcsm、防火墙、公网地址、图标、前端冒烟、重启/换端口生效），可整个删除
   启动.bat            Windows 中文版（GBK 编码）
   start.bat           Windows 英文版（控制台无中文时用）
   安装服务.bat        Windows：注册 / 起停 / 自启 / 卸载（会请求管理员权限）
@@ -273,6 +276,32 @@ hmcsm url off                      # 清除，改回按当前 IP + 端口
 - 没有 hover 的触屏上，删除 / 行内操作按钮常显（不用「悬停才出现」）
 - 输入框统一 16px，避免 iOS 聚焦时自动放大页面；登录页同样处理
 - 如果点「启动服务端」只是弹一句「需要先勾选同意 Minecraft EULA」，弹窗会自动滚到上面的勾选框，不用自己找
+
+### 站点图标 / 添加到主屏幕
+
+浏览器标签页、侧栏左上角、手机桌面图标用的是同一张图：`public/brand/HYCX-MC.png`（像素风方块）。
+首次放进仓库时已生成好全套尺寸，直接生效：
+
+| 文件 | 用途 |
+| --- | --- |
+| `favicon.ico`（内嵌 16/32/48/64 PNG） | 浏览器标签页、Windows 快捷方式 |
+| `favicon-16/32/48.png` | 现代浏览器按屏幕 DPI 挑尺寸 |
+| `apple-touch-icon.png`（180） | iPhone / iPad「添加到主屏幕」 |
+| `icon-192/512.png`、`icon-maskable-*.png` | PWA（`manifest.webmanifest`） |
+
+手机浏览器里「添加到主屏幕」会得到一个独立窗口的 HMCS 图标，没有地址栏 —— 配合 `dvh` 布局正好铺满。
+`manifest` 的 `display: standalone`、主题色与站点一致；maskable 图标把图案缩到 78% 并补深色底，
+避免被 Android 的圆形遮罩裁掉四个角。
+
+换 logo 时把新的**正方形 PNG** 覆盖到 `public/brand/HYCX-MC.png`，跑一次：
+
+```bash
+node scripts/make-icons.js                  # 用 public/brand/ 里的源图
+node scripts/make-icons.js D:\Pictures\new.png   # 也可以直接指定源文件
+```
+
+纯 Node 实现（只用了内置 `zlib`），不引入图像库；像素画用最近邻缩放，方块边缘不会被双线性插值糊掉。
+`_dev/_test-icons.js` 会校验 PNG / ICO 二进制结构、manifest、页面引用和静态服务返回的 MIME。
 
 ## 注册成系统服务
 

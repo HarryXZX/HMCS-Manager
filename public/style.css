@@ -51,8 +51,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--blue)}
 }
 .brand{display:flex;align-items:center;gap:10px;padding:16px 16px 12px}
 .brand .mark{
-  width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),#1f8f4e);
-  display:grid;place-items:center;font-weight:700;color:#06120a;font-size:13px;letter-spacing:.5px;
+  width:28px;height:28px;border-radius:8px;display:block;flex:0 0 28px;
+  object-fit:cover;image-rendering:pixelated; /* 像素画 logo，别被浏览器插值糊掉 */
 }
 .brand b{font-size:15px;letter-spacing:.3px}
 .brand span{display:block;font-size:11px;color:var(--faint);font-weight:400;letter-spacing:.4px}
@@ -270,7 +270,7 @@ tr:hover .act{opacity:1}
   #sidebar.open{transform:none}
   .icon-btn{display:inline-flex}
   .brand{padding:12px 12px 10px;gap:8px}
-  .brand .mark{width:26px;height:26px;font-size:12px}
+  .brand .mark{width:26px;height:26px;flex-basis:26px}
   .brand b{font-size:14px}
   .brand span{font-size:10.5px}
   #sidebar-close{margin-left:auto;border-color:transparent;background:transparent;color:var(--muted);font-size:22px;width:32px;height:32px;flex-basis:32px}
