@@ -188,10 +188,14 @@ function applySettings(boot) {
 /** 服务路径走不通时的退路：脱离终端的独立进程（实现在 launch.js，菜单也用它） */
 function spawnDetached(boot, settings) {
   return launch.spawnDetached({
-    port: boot.port || settings.port,
-    host: boot.host || settings.host,
+    // 只把「命令行里真的给了」的 --port / --host 传给 app.js。
+    // settings 里的值让 app.js 自己读配置文件，别再反过来覆盖它。
+    port: boot.port || 0,
+    host: boot.host || '',
     home: boot.home,
     extraArgs: boot.pass,
+    recordPort: settings.port,
+    recordHost: settings.host,
   });
 }
 

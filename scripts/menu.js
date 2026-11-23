@@ -184,7 +184,9 @@ async function actStart(st) {
   if (st.installed) { runService(['start']); return; }
 
   info('服务未安装，改为启动独立后台进程（关掉终端也不影响）…');
-  const r = launch.spawnDetached({ port: st.port, host: st.settings.host });
+  // 不传 --host / --port：让 app.js 直接读 settings.json，
+  // 否则菜单启动会把配置里的监听地址当命令行参数反向写回去。
+  const r = launch.spawnDetached({ recordPort: st.port, recordHost: st.settings.host });
   if (!r.ok) { bad('启动失败：' + r.error); return; }
   if (await waitUp(st.port, 25)) {
     ok(`已启动  pid=${r.pid}  http://127.0.0.1:${st.port}`);

@@ -1283,6 +1283,7 @@ async function viewNetwork(i) {
             : '当前没有由 HMCS 建立的映射'}</span>
         </div>
         ${st.lastError ? `<div class="hint" style="color:#ffb4b0">上次失败：${esc(st.lastError)}</div>` : ''}
+        ${cfg.auto && !(st.added || []).length ? `<div class="tip" style="margin-top:10px;color:#f0c674">已开启自动映射：下次「启动服务端」时才会自动建立。如果服务端已经在运行，点上面的「立即建立映射」，或重启一次服务端。</div>` : ''}
       </div>
     </div>
 
@@ -1495,6 +1496,7 @@ async function viewSettings(i) {
           ${suAdded ? '当前映射：' + esc(suAdded) : '当前没有由 HMCS 建立的映射'}
           ${su.lastError ? '<br><span style="color:#ff9a94">上次失败：' + esc(su.lastError) + '</span>' : ''}
         </div>
+        ${su.hint ? `<div class="tip" id="s-upnp-hint" style="margin-top:8px;color:#f0c674">${esc(su.hint)}</div>` : ''}
         <div class="tip" id="s-net-urls">${urls.length ? '可访问地址：' + urls.map(u => `<span class="mono">${esc(u)}</span>`).join('　') : ''}</div>
       </div>
     </div>`;
@@ -1887,7 +1889,10 @@ async function viewSettings(i) {
         },
       });
       state.boot.net.selfUpnp = r.self;
-      toast(upnpAuto.checked ? '已开启：启动时自动映射本机端口' : '已关闭自动映射');
+      // hint 是「开关开了但这次没生效」的原因（典型：只监听 127.0.0.1），
+      // 必须直接告诉用户，别让他对着一个勾上的开关猜。
+      if (r.self && r.self.hint) toast(r.self.hint, 'warn');
+      else toast(upnpAuto.checked ? '已开启：启动时自动映射本机端口' : '已关闭自动映射');
       if (tpl === state.tab) await renderView();
     } catch (e) {
       toast(e.message, 'err');

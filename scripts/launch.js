@@ -17,18 +17,28 @@ const paths = require('../lib/paths');
 const ROOT = path.resolve(__dirname, '..');
 const APP = path.join(ROOT, 'app.js');
 
+/** 只把用户显式给的监听参数写进命令行；单独导出方便自测断言 */
+function buildArgs(opts = {}) {
+  const args = [APP];
+  if (Number(opts.port)) args.push('--port', String(Number(opts.port)));
+  if (opts.host) args.push('--host', String(opts.host));
+  if (opts.home) args.push('--home', String(opts.home));
+  args.push(...(Array.isArray(opts.extraArgs) ? opts.extraArgs : []));
+  if (!args.includes('--log-file')) args.push('--log-file');
+  return args;
+}
+
 function spawnDetached(opts = {}) {
+  // port / host 只有「用户这次显式给的」才变成 --port / --host。
+  // 早期版本把 settings.json 里的值也当命令行参数传，app.js 会把命令行参数
+  // 反向写回 settings.json —— 界面里刚改的监听地址，用菜单启动一次就被旧值盖回去。
   const port = Number(opts.port) || 0;
   const host = String(opts.host || '');
-  const home = String(opts.home || '');
-  const extraArgs = Array.isArray(opts.extraArgs) ? opts.extraArgs.slice() : [];
+  // 这两个只写进 background.pid 供排障查看，不参与进程启动参数
+  const recordPort = Number(opts.recordPort) || port || Number(paths.readSettings().port) || 8720;
+  const recordHost = String(opts.recordHost || host || paths.readSettings().host || '127.0.0.1');
 
-  const args = [APP];
-  if (port) args.push('--port', String(port));
-  if (host) args.push('--host', host);
-  if (home) args.push('--home', home);
-  args.push(...extraArgs);
-  if (!args.includes('--log-file')) args.push('--log-file');
+  const args = buildArgs(opts);
 
   // 环境里残留的监听变量会压过 settings.json，跟命令行参数同样的坑，一并摘掉
   const env = { ...process.env, HMCS_BACKGROUND: '1' };
@@ -52,11 +62,11 @@ function spawnDetached(opts = {}) {
   try {
     fs.mkdirSync(paths.CONFIG_DIR, { recursive: true });
     fs.writeFileSync(path.join(paths.CONFIG_DIR, 'background.pid'),
-      JSON.stringify({ pid: child.pid, port, host, startedAt: new Date().toISOString() }, null, 2),
+      JSON.stringify({ pid: child.pid, port: recordPort, host: recordHost, startedAt: new Date().toISOString() }, null, 2),
       { encoding: 'utf8', mode: 0o600 });
   } catch { /* 只读目录不影响运行 */ }
 
-  return { ok: true, pid: child.pid, port };
+  return { ok: true, pid: child.pid, port: recordPort };
 }
 
-module.exports = { spawnDetached, APP, ROOT };
+module.exports = { spawnDetached, buildArgs, APP, ROOT };

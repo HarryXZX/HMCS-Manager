@@ -394,7 +394,7 @@ register('GET', '/api/bootstrap', async (req, res) => {
         `http://127.0.0.1:${RUNTIME.port}`,
         ...(isLoopbackHost(RUNTIME.host) ? [] : selfmap.lanAddresses(RUNTIME.port).map(a => a.url)),
       ],
-      selfUpnp: selfmap.status({ port: RUNTIME.port }),
+      selfUpnp: selfmap.status({ port: RUNTIME.port, bindHost: RUNTIME.host }),
       // 轻量：只读状态文件，不在这里跑 netsh / ufw 探测
       firewall: {
         rule: firewall.RULE_NAME,
@@ -1062,7 +1062,7 @@ register('PUT', '/api/auth/options', async (req, res) => {
 
 // ---- 管理器自身端口（远程访问）
 register('GET', '/api/net/self', async (req, res, p, q) => {
-  const st = selfmap.status({ port: RUNTIME.port });
+  const st = selfmap.status({ port: RUNTIME.port, bindHost: RUNTIME.host });
   const out = {
     ...st,
     bind: { host: RUNTIME.host, port: RUNTIME.port, localOnly: isLoopbackHost(RUNTIME.host) },
@@ -1083,9 +1083,9 @@ register('GET', '/api/net/self', async (req, res, p, q) => {
     }
   }
   out.ready = !!(st.added && st.added.length);
-  out.hint = out.bind.localOnly
+  out.hint = st.hint || (out.bind.localOnly
     ? '当前只监听本机 127.0.0.1，端口映射建好也访问不到。先把「监听地址」改成外部可访问。'
-    : '';
+    : '');
   sendJson(res, 200, out);
 });
 
@@ -1101,11 +1101,12 @@ register('PUT', '/api/net/self', async (req, res) => {
     ...(body.protocol !== undefined ? { protocol: ['TCP', 'UDP'].includes(body.protocol) ? body.protocol : cur.protocol } : {}),
     ...(body.lease !== undefined && Number.isFinite(Number(body.lease)) ? { lease: Math.max(0, Number(body.lease)) } : {}),
   };
-  if (next.auto && isLoopbackHost(RUNTIME.host)) {
-    const e = new Error('当前只监听 127.0.0.1，端口映射没有意义。请先把监听地址改为「允许外部访问」'); e.status = 400; throw e;
-  }
+  // 不再因为「当前只监听本机」就拒绝保存 auto：常见顺序是先开自动映射、
+  // 再到上面改监听地址、最后一起重启，两步互相卡死只会让人以为开关坏了。
+  // 改为照常落盘，并把「为什么这次没生效」通过 status.hint 返回给界面。
   writeSettings({ selfUpnp: next });
-  sendJson(res, 200, { ok: true, self: selfmap.status({ port: RUNTIME.port }) });
+  const st = selfmap.status({ port: RUNTIME.port, bindHost: RUNTIME.host });
+  sendJson(res, 200, { ok: true, self: st, hint: st.hint });
 });
 
 register('POST', '/api/net/selfmap', async (req, res) => {
@@ -1563,6 +1564,12 @@ function start() {
     });
 
     const selfUpnp = readSettings().selfUpnp || {};
+    if (selfUpnp.auto && localOnly) {
+      // 以前这里直接什么都不做：开关勾着、映射没建、界面也不说原因。
+      // 现在把这条写进启动日志，配合 status().hint 让设置页能解释清楚。
+      console.warn('[HMCS] 已开启「启动时自动映射」，但当前只监听 127.0.0.1 —— 本次未建立映射。'
+        + '把设置里的「监听地址」改为允许外部访问并重启后即可生效。');
+    }
     if (selfUpnp.auto && !localOnly) {
       selfmap.apply({ port }).then(r => {
         const ext = (r.added[0] || {}).externalPort;
