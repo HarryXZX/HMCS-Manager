@@ -4,10 +4,13 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// 换端口重启后会带着 #settings 跳过来，让用户直接看到「黄条已消失」
+const HASH_TAB = /^#(overview|console|files|config|plugins|world|network|settings)$/.exec(location.hash || '');
+
 const state = {
   boot: null,
   instId: localStorage.getItem('hmcs.inst') || '',
-  tab: 'overview',
+  tab: HASH_TAB ? HASH_TAB[1] : 'overview',
   es: null,
   filesPath: '',
   cfgTarget: 'props',
@@ -1677,9 +1680,24 @@ async function viewSettings(i) {
   if (restartBtn) restartBtn.onclick = async () => {
     const runningInst = (state.boot.instances || []).filter(i => i.runtime && i.runtime.status !== 'stopped');
     const names = runningInst.map(i => i.name).join('、');
-    const tip = runningInst.length
-      ? `重启会先安全关闭正在运行的 ${runningInst.length} 个服务端（${names}），等它们写完存档再退出。\n\n确定现在重启？`
-      : '重启期间页面会断开几秒，之后自动恢复。\n\n确定现在重启？';
+
+    // 重启后页面要落到哪儿：端口变了就换端口，改成仅本机就只能走回环地址
+    const herePort = Number(location.port) || (location.protocol === 'https:' ? 443 : 80);
+    const portChanging = Number(wantPort) !== herePort;
+    const hereIsLoopback = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(location.hostname);
+    const goingLocalOnly = !hereIsLoopback && wantHost === '127.0.0.1';
+    let nextUrl = '';
+    if (portChanging || goingLocalOnly) {
+      const host = goingLocalOnly ? '127.0.0.1' : location.hostname;
+      nextUrl = `${location.protocol}//${host}:${wantPort}${location.pathname}${location.search}#${state.tab || 'settings'}`;
+    }
+
+    let tip = runningInst.length
+      ? `重启会先安全关闭正在运行的 ${runningInst.length} 个服务端（${names}），等它们写完存档再退出。`
+      : '重启期间页面会断开几秒，之后自动恢复。';
+    if (nextUrl) tip += `\n\n新地址是 ${nextUrl}，页面会自动跳过去。`;
+    if (goingLocalOnly) tip += '\n\n注意：改成「仅本机」以后，用局域网 / 公网地址就再也进不来了，只能在这台机器上开。';
+    tip += '\n\n确定现在重启？';
     if (!window.confirm(tip)) return;
 
     const stateEl = $('#s-restart-state');
@@ -1695,14 +1713,23 @@ async function viewSettings(i) {
     catch { /* 进程退得比响应快时连接会断，这不是失败 */ }
 
     if (stateEl) stateEl.textContent = '正在等待 HMCS 重新启动…';
-    const up = await waitForRestart(beforePid);
+    const up = await waitForRestart(beforePid, portChanging ? wantPort : 0);
     if (up) {
-      if (stateEl) stateEl.textContent = '已重启，正在刷新页面…';
-      setTimeout(() => location.reload(), 300);
+      if (nextUrl) {
+        if (stateEl) stateEl.textContent = '已重启，正在跳转到 ' + nextUrl;
+        setTimeout(() => location.replace(nextUrl), 500);
+      } else {
+        if (stateEl) stateEl.textContent = '已重启，正在刷新页面…';
+        setTimeout(() => location.reload(), 300);
+      }
     } else {
       restartBtn.disabled = false;
       restartBtn.textContent = oldText;
-      if (stateEl) stateEl.textContent = '';
+      if (stateEl) {
+        stateEl.textContent = portChanging
+          ? `新端口 ${wantPort} 一直没起来，可能没抢到端口或启动报错：去看日志，或在新窗口打开 ${nextUrl || ''} 试试。`
+          : '';
+      }
       toast('重启超时：请查看日志，或手动运行 hmcsm 重新启动', 'err');
     }
   };
@@ -1842,17 +1869,31 @@ async function viewSettings(i) {
  *
  * 判定「回来了」必须看 pid 变化：旧进程在关闭过程中 ping 可能还短暂可用，
  * 只看 HTTP 200 会立刻当成功，刷新后看到的还是旧进程。
+ *
+ * 端口变了就不一样了：新地址跟老页面不同源，fetch 要跨源读（后端对 ping 放开了 CORS，
+ * 但不返回 pid）。这时也不用比 pid —— 旧进程根本不可能监听新端口。
  */
-function waitForRestart(prevPid, timeoutMs = 60000) {
+function waitForRestart(prevPid, targetPort = 0, timeoutMs = 60000) {
+  const herePort = Number(location.port) || (location.protocol === 'https:' ? 443 : 80);
+  const port = Number(targetPort) || herePort;
+  const crossPort = port !== herePort;
+  const url = crossPort
+    ? `${location.protocol}//${location.hostname}:${port}/api/system/ping`
+    : '/api/system/ping';
+
   const t0 = Date.now();
   return new Promise(resolve => {
     const tick = async () => {
       if (Date.now() - t0 > timeoutMs) return resolve(false);
       try {
-        const r = await fetch('/api/system/ping', { cache: 'no-store' });
+        const r = await fetch(url, { cache: 'no-store' });
         if (r.ok) {
           const d = await r.json();
-          if (d && d.ok && d.pid && d.pid !== prevPid) return resolve(true);
+          if (crossPort) {
+            if (d && d.ok && Number(d.port) === port) return resolve(true);
+          } else if (d && d.ok && d.pid && d.pid !== prevPid) {
+            return resolve(true);
+          }
         }
       } catch { /* 端口还没起来 */ }
       setTimeout(tick, 600);

@@ -56,6 +56,13 @@ const sandbox = {
   location: {
     search: '?tab=' + (process.env.SMOKE_TAB || 'overview') +
       (process.env.SMOKE_INST ? '&inst=' + encodeURIComponent(process.env.SMOKE_INST) : ''),
+    hash: process.env.SMOKE_HASH || '',
+    // 一键重启里会拼「跳转到新地址」，这些字段得给全，否则点到就抛错
+    protocol: 'http:',
+    hostname: '127.0.0.1',
+    host: '127.0.0.1:8720',
+    port: '8720',
+    pathname: '/',
     href: BASE + '/',
     // 登录态失效时 app.js 会 location.replace 到登录页，桩里得接住
     replace(u) { this.href = u; },
@@ -69,9 +76,19 @@ const sandbox = {
     addEventListener() {},
     body: mkEl('body'),
   },
-  fetch: (u, init) => {
+  fetch: async (u, init) => {
     const url = String(u).startsWith('http') ? String(u) : BASE + String(u);
-    return fetch(url, init);
+    const r = await fetch(url, init);
+    // SMOKE_BIND=host:port 伪造「正在运行的监听地址」，用来验证
+    // 「保存值 ≠ 运行值」时黄条是否出现（不改真实后端，也不会触发重启）
+    if (process.env.SMOKE_BIND && /\/api\/bootstrap/.test(url) && r.ok) {
+      const j = await r.json();
+      const [h, p] = String(process.env.SMOKE_BIND).split(':');
+      j.net = j.net || {};
+      j.net.bind = { host: h, port: Number(p), localOnly: !/^(0\.0\.0\.0|::)$/.test(h) };
+      return new Response(JSON.stringify(j), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return r;
   },
   alert: () => {},
   confirm: () => true,

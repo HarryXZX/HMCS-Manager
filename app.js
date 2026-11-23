@@ -1070,7 +1070,20 @@ register('POST', '/api/net/unmap', async (req, res) => {
 
 // ---- 系统（服务脚本 / 排障）
 register('GET', '/api/system/ping', async (req, res) => {
-  sendJson(res, 200, { ok: true, app: 'HMCS', version: pkg.version, pid: process.pid, port: RUNTIME.port });
+  // 换了端口以后，还停在旧地址的页面要能探到新进程是不是起来了，
+  // 这就得允许跨源读这个端点。它是免鉴权的探活接口，只给非敏感字段：
+  // 跨源请求不返回 pid / 版本，避免随便哪个网页都能指纹识别本机面板。
+  const origin = req.headers.origin || '';
+  const sameOrigin = !origin || origin.replace(/^https?:\/\//i, '').toLowerCase() === String(req.headers.host || '').toLowerCase();
+  const body = { ok: true, app: 'HMCS', port: RUNTIME.port };
+  if (sameOrigin) {
+    body.version = pkg.version;
+    body.pid = process.pid;
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  sendJson(res, 200, body);
 });
 
 register('GET', '/api/system/info', async (req, res) => {
@@ -1337,7 +1350,7 @@ function start() {
     process.exit(2);
   }
   if (ARGS.port || ARGS.host) {
-    console.log(`[HMCS] 命令行覆盖监听参数：${host}:${port}（不改写 settings.json）`);
+    console.log(`[HMCS] 命令行覆盖监听参数：${host}:${port}`);
   }
 
   // 监听非回环地址而没设密码，等于把管理面板（含文件管理、控制台）公开到网络上
@@ -1361,6 +1374,22 @@ function start() {
   RUNTIME.port = port;
   RUNTIME.host = host;
 
+  // 命令行给的监听参数本来就优先级最高，顺手同步进 settings.json。
+  // 不同步的话，界面上「目标值」会是一份陈旧配置：明明在跑 9000，界面显示 8720 待生效，
+  // 点一下重启反而跳回 8720 —— 说不清到底听谁的。同步之后
+  // 「界面显示的目标值 == 重启后的实际值」这个前提永远成立。
+  if (ARGS.port || ARGS.host) {
+    try {
+      const patch = {};
+      if (ARGS.port) patch.port = port;
+      if (ARGS.host) patch.host = host;
+      writeSettings(patch);
+      console.log(`[HMCS] 命令行监听参数已同步到 settings.json（${host}:${port}）`);
+    } catch (e) {
+      console.warn('[HMCS] 命令行监听参数无法写入 settings.json：' + e.message);
+    }
+  }
+
   // 提前把控制令牌写好：服务脚本要在任何请求之前就能拿到它来做优雅停止
   try { auth.controlToken(); } catch { /* 只读目录时退化为仅进程内有效 */ }
 
@@ -1368,8 +1397,14 @@ function start() {
   // 只有带这个环境变量（即新进程由 restartSelf 拉起）才重试等端口，正常启动仍然是立刻报错。
   const HANDOFF = process.env.HMCS_RESTART_HANDOFF === '1';
   let listenTries = 0;
+  let up = false;
 
   const onListening = () => {
+    // 交接期间下面会反复 listen 重试。Node 的 listen(port, host, cb) 是把 cb 挂到 'listening' 上，
+    // 每重试一次就多挂一个；端口一被释放，所有回调同时触发 —— 日志被刷十几遍、
+    // selfmap 会把同一条 UPnP 规则建十几遍。这里必须幂等。
+    if (up) return;
+    up = true;
     const localOnly = isLoopbackHost(host);
     console.log('');
     console.log('HYCX MC Server Manager (HMCS) v' + pkg.version + ' 已启动');
@@ -1409,7 +1444,8 @@ function start() {
       if (listenTries === 1) console.log(`[HMCS] 等待上一个进程释放端口 ${port}…`);
       setTimeout(() => {
         server.once('error', onListenError);
-        try { server.listen(port, host, onListening); } catch { /* 下一轮再试 */ }
+        // 不再传 onListening：第一次 listen 时已经挂上了，重复挂会叠出多个回调
+        try { server.listen(port, host); } catch { /* 下一轮再试 */ }
       }, 250);
       return;
     }
@@ -1438,22 +1474,61 @@ function start() {
  *  - 其它情况（手动运行 / Windows 计划任务 / launchd）：现场拉起一个自己的副本，
  *    参数原样继承（--home / --log-file 必须带上，否则数据目录会跑偏），再从容退出。
  */
+/**
+ * 给「新进程」准备的参数：原样继承，但必须摘掉监听参数。
+ *
+ * 为什么不能照抄 process.argv：命令行参数的优先级高于 settings.json，
+ * 而重启的唯一目的就是让刚保存的 host/port 生效。
+ * 若原进程是用 `--port 8720`（或 HMCS_PORT 环境变量）起的，
+ * 照抄过去新进程还是监听 8720，界面上的「重启后生效」黄条就永远消不掉。
+ * 同理，`--home` / `--log-file` / `--allow-insecure` 必须保留，否则数据目录会跑偏。
+ */
+function relaunchArgs() {
+  const raw = process.argv.slice(1);
+  const out = [];
+  for (let i = 0; i < raw.length; i++) {
+    const a = raw[i];
+    const key = a.includes('=') ? a.slice(0, a.indexOf('=')) : a;
+    if (key === '--port' || key === '-p' || key === '--host' || key === '-H') {
+      if (!a.includes('=')) i++; // 顺带吃掉它的值
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+/** 新进程的环境：同样要摘掉会压低 settings 的监听变量 */
+function relaunchEnv() {
+  const env = { ...process.env, HMCS_RESTART_HANDOFF: '1' };
+  delete env.HMCS_PORT;
+  delete env.HMCS_HOST;
+  return env;
+}
+
 function restartSelf(reason) {
   if (process.env.INVOCATION_ID) {
+    // systemd 的 ExecStart 不带监听参数（写完设置就靠 settings.json），
+    // 靠 unit 里的 Restart=always 拉起新进程即可。
     console.log('[HMCS] 重启：由 systemd 拉起新进程');
     gracefulShutdown(reason, 0);
     return { mode: 'systemd' };
   }
 
+  const args = relaunchArgs();
+  if (ARGS.port || ARGS.host || process.env.HMCS_PORT || process.env.HMCS_HOST) {
+    console.log('[HMCS] 重启：丢弃命令行 / 环境变量里的监听参数，改以 settings.json 为准');
+  }
+
   let child;
   try {
-    child = spawn(process.execPath, process.argv.slice(1), {
+    child = spawn(process.execPath, args, {
       cwd: process.cwd(),
       detached: true,
       // 新进程的 stdout 不是 TTY，logger 会自动落盘到 <数据目录>/logs/manager.log
       stdio: 'ignore',
       windowsHide: true,
-      env: { ...process.env, HMCS_RESTART_HANDOFF: '1' },
+      env: relaunchEnv(),
     });
   } catch (e) {
     console.error('[HMCS] 拉起新进程失败：' + e.message);

@@ -176,6 +176,11 @@ function readLog(p) {
   check('C 退出后 D 接管端口', !!dUp, '等待超时');
   if (dUp) check('接管的是 D', dUp.pid === D.pid, `C=${cUp.pid} D=${D.pid} 实际=${dUp.pid}`);
   check('D 日志里有「等待上一个进程释放端口」', /等待上一个进程释放端口/.test(readLog(D.__log)));
+  // 重试期间每 250ms 一次 listen，如果把 onListening 反复挂上去，
+  // 端口一空闲就会同时回放十几次启动流程（日志刷屏、UPnP 规则被重复建立）。
+  // 这个文件里应该只有 C 和 D 各启动一次。
+  const starts = (readLog(path.join(home3, 'logs', 'manager.log')).match(/已启动/g) || []).length;
+  check('端口交接只触发一次启动回调', starts === 2, `日志里出现 ${starts} 次「已启动」（期望 C、D 各一次）`);
 
   await post(PORT, '/api/system/shutdown');
   await sleep(1200);
