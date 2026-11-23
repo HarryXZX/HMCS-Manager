@@ -314,6 +314,9 @@ HMCS · HYCX MC Server Manager  v${pkg.version}
   hmcsm firewall                查看防火墙放行状态
   hmcsm firewall sync          按配置同步防火墙规则（Linux 用 sudo）
   hmcsm firewall on | off      手动放行 / 收回入站端口
+  hmcsm url                     查看当前公网访问地址（域名 / 反代）
+  hmcsm url https://mc.example.com   设置（改端口重启后页面会跳到它）
+  hmcsm url off                 清除，改回按当前 IP + 端口访问
   hmcsm menu                    直接打开命令行控制台
 
 服务命令（等价于 install-service.sh / 安装服务.bat 里的同名项）
@@ -338,6 +341,42 @@ function runFirewall(args) {
     cwd: ROOT, stdio: 'inherit', timeout: 120000,
   });
   return r.status === null ? 0 : r.status;
+}
+
+/**
+ * 公网访问地址（域名 / 反代）：hmcsm url [地址|off]
+ *
+ * 只影响「显示哪个地址」和「改端口重启后跳到哪」，不参与监听，
+ * 所以直接写 settings.json 就生效，不用重启。
+ */
+function cmdPublicUrl(args) {
+  // --home 是全局参数（preParseHome 已经吃掉了），别把它当成地址
+  const rest = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--home') { i++; continue; }
+    if (a.startsWith('--home=')) continue;
+    rest.push(a);
+  }
+  const cur = paths.readSettings().publicUrl || '';
+  const v = String(rest[0] || '').trim();
+  if (!v) {
+    say('');
+    say('  公网访问地址  ' + (cur ? c.bold(cur) : c.dim('未设置（按当前 IP + 端口访问）')));
+    say('  ' + c.dim('设置：hmcsm url https://mc.example.com　　清除：hmcsm url off'));
+    say('');
+    return 0;
+  }
+  if (v === 'off' || v === 'none' || v === '-') {
+    paths.writeSettings({ publicUrl: '' });
+    ok('已清除公网访问地址，之后按当前 IP + 端口访问');
+    return 0;
+  }
+  let n;
+  try { n = paths.normalizePublicUrl(v); } catch (e) { bad(e.message); return 1; }
+  paths.writeSettings({ publicUrl: n });
+  ok('公网访问地址已保存为 ' + n + c.dim('（立即生效；确认 DNS / 反代指向本机）'));
+  return 0;
 }
 
 /**
@@ -397,6 +436,8 @@ async function main() {
   if (head === 'passwd' || head === 'password') return cmdPasswd(argv);
   // 防火墙：hmcsm firewall [status|sync|on|off]
   if (head === 'firewall' || head === 'fw') return runFirewall(argv.slice(1));
+  // 公网访问地址：hmcsm url [地址|off]
+  if (head === 'url' || head === 'public-url') return cmdPublicUrl(argv.slice(1));
   // 服务子命令：原样交给 service.js，它才是实现方
   if (SUBCOMMANDS.has(head)) {
     const r = runService(argv);

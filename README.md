@@ -24,7 +24,7 @@
   scripts/            hmcsm.js（命令行入口）/ menu.js（命令行控制台）/ service.js（服务注册与管理）
                       firewall-cli.js（防火墙）/ install-cli.js（写 PATH）/ launch.js（脱离终端启动）
                       prompt.js（终端输入）/ reset-password.js（重置密码）
-  _dev/               自测脚本（UPnP 网关、认证、hmcsm、防火墙、前端冒烟、重启/换端口生效），可整个删除
+  _dev/               自测脚本（UPnP 网关、认证、hmcsm、防火墙、公网地址、前端冒烟、重启/换端口生效），可整个删除
   启动.bat            Windows 中文版（GBK 编码）
   start.bat           Windows 英文版（控制台无中文时用）
   安装服务.bat        Windows：注册 / 起停 / 自启 / 卸载（会请求管理员权限）
@@ -93,6 +93,7 @@ node scripts/install-cli.js uninstall   # 卸
 hmcsm                        # 打开命令行控制台（启停 / 安装 / 自启 / 密码 / 公网 / 防火墙）
 hmcsm passwd                 # 改访问密码（两次输入，不回显；不需要旧密码）
 hmcsm firewall sync          # 按配置同步防火墙规则
+hmcsm url https://mc.example.com   # 设置公网访问地址（改端口重启后跳到它）
 hmcsm --port 8800            # 以服务方式启动，端口存为 8800
 hmcsm --host 0.0.0.0         # 允许局域网 / 外网访问（必须先设密码）
 hmcsm stop                   # 停止（会先让 Minecraft 存档退出）
@@ -228,6 +229,30 @@ node scripts/reset-password.js --clear      # 关掉密码访问
 ```
 
 **关于 HTTPS**：内置服务是明文 HTTP，经公网直接访问时密码在链路上可见。正经做法是套一层 Nginx / Caddy 做 TLS 反代（或用内网穿透自带的加密隧道），反代后把「信任反向代理头」打开，并把监听地址改回 `127.0.0.1` —— 反代和 HMCS 在同一台机器时这是最安全的组合。
+
+### 公网地址：域名由你自己填
+
+「监听地址」管的是 HMCS 听哪个网卡，「对外用哪个地址访问」是另一件事。套了 Nginx / Caddy / CDN 之后，面板内部端口怎么改，外部地址通常一直是 `https://mc.example.com`。所以设置页「远程访问」里留了一个可选项：
+
+```
+公网访问地址（可选，域名 / 反向代理）
+```
+
+- 填了以后，**关于页 / 命令行 `hmcsm status` 的访问地址**都优先显示它
+- **改端口重启后，页面跳到它**，不再拼「当前 IP : 新端口」—— 反代 / CDN 后面这是唯一正确的落点
+- 留空就按当前访问地址走，和以前一样
+- 只接受 `http://` / `https://`，可带端口和路径前缀（`https://mc.example.com:8720`、`https://example.com/hmcs`），不带协议自动补 `http://`
+- 拒绝 `javascript:` / `data:` / 带账号密码 / 带查询串 —— 这个值会直接用于页面跳转，不能让它变成 XSS 入口
+- 纯展示 + 跳转，**不参与监听**，保存即生效，不用重启
+
+从本机（`127.0.0.1`）操作时仍然跳本机地址，避免「改个端口被扔去走公网」；从局域网 IP 访问时会跳到域名，若内网回不到公网（NAT 回流没开），重启确认框里会同时给出直连地址兜底。反向代理场景下监听地址应保持「仅本机」，只让反代能连到面板；**面板内部端口改了，反代里的 `proxy_pass` 要同步改**（域名不用动，所以对外地址始终是同一个）。
+
+```bash
+hmcsm url                          # 看当前填了什么
+hmcsm url https://mc.example.com   # 设置
+hmcsm url off                      # 清除，改回按当前 IP + 端口
+```
+
 
 ### 自动端口映射（UPnP）
 
@@ -474,7 +499,7 @@ GET  /api/fs/browse?path=               列子目录（目录选择器用）
 POST /api/fs/mkdir                      新建目录
 POST /api/reveal                        在资源管理器里打开路径
 GET  /api/clients                       探测本机客户端实例（只读建议）
-PUT  /api/settings                      保存设置（serversDir / clientRoots / extraWorldDirs / memory / javaPath / host / port）
+PUT  /api/settings                      保存设置（serversDir / clientRoots / extraWorldDirs / memory / javaPath / host / port / publicUrl）
 POST /api/system/restart                重启自己（改完端口 / 监听地址不用回命令行）
 POST /api/system/firewall               同步 / 收回防火墙规则（control token，仅本机）
 POST /api/auth/local                    本机运维改密码 / 开关校验 / 免密范围（control token，不要旧密码）

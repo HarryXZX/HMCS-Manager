@@ -385,7 +385,11 @@ register('GET', '/api/bootstrap', async (req, res) => {
     },
     net: {
       bind: { host: RUNTIME.host, port: RUNTIME.port, localOnly: isLoopbackHost(RUNTIME.host) },
+      // 用户自己填的公网地址（域名 / 反代）。填了就是「首选访问地址」，
+      // 重启跳转、概览页、命令行状态都会优先用它。
+      publicUrl: settings.publicUrl || '',
       urls: [
+        ...(settings.publicUrl ? [settings.publicUrl] : []),
         `http://127.0.0.1:${RUNTIME.port}`,
         ...(isLoopbackHost(RUNTIME.host) ? [] : selfmap.lanAddresses(RUNTIME.port).map(a => a.url)),
       ],
@@ -1163,7 +1167,9 @@ register('GET', '/api/system/info', async (req, res) => {
     startedAt: new Date(RUNTIME.startedAt).toISOString(),
     uptimeSec: Math.round((Date.now() - RUNTIME.startedAt) / 1000),
     bind: { host: RUNTIME.host, port: RUNTIME.port, localOnly: isLoopbackHost(RUNTIME.host) },
+    publicUrl: s.publicUrl || '',
     urls: [
+      ...(s.publicUrl ? [s.publicUrl] : []),
       `http://127.0.0.1:${RUNTIME.port}`,
       ...(isLoopbackHost(RUNTIME.host) ? [] : selfmap.lanAddresses(RUNTIME.port).map(a => a.url)),
     ],
@@ -1267,6 +1273,14 @@ register('PUT', '/api/settings', async (req, res) => {
     const p = Number(body.port);
     if (!Number.isInteger(p) || p < 1 || p > 65535) { const e = new Error('端口必须在 1-65535 之间'); e.status = 400; throw e; }
     patch.port = p;
+  }
+  // 公网访问地址（域名 / 反代）：纯展示 + 跳转用，不参与监听，改完不需要重启
+  if (body.publicUrl !== undefined) {
+    try {
+      patch.publicUrl = paths.normalizePublicUrl(body.publicUrl);
+    } catch (e) {
+      const err = new Error(e.message); err.status = 400; throw err;
+    }
   }
 
   // 服务端实例存放目录：必须是绝对路径，且能创建 / 可写
@@ -1515,9 +1529,11 @@ function start() {
     if (up) return;
     up = true;
     const localOnly = isLoopbackHost(host);
+    const pubUrl = readSettings().publicUrl || '';
     console.log('');
     console.log('HYCX MC Server Manager (HMCS) v' + pkg.version + ' 已启动');
     console.log('  本机访问  http://127.0.0.1:' + port);
+    if (pubUrl) console.log('  公网地址  ' + pubUrl + '（设置里填的，改端口重启后会跳到它）');
     if (!localOnly) {
       for (const a of selfmap.lanAddresses(port)) console.log('  局域网    ' + a.url + '  (' + a.iface + ')');
       const au = readSettings().auth;

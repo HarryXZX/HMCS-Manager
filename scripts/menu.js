@@ -158,6 +158,7 @@ function renderStatus(st) {
   say('  运行状态  ' + (st.up ? c.green('● 运行中') + '  ' + c.bold(runUrl) : c.dim('○ 未运行')));
   say('  监听配置  ' + c.bold(host + ':' + port) + c.dim('  密码 ' + (a.hash ? '已设' : '未设') + ' · ' + scope));
   say('  访问密码  ' + pwd);
+  say('  公网地址  ' + (st.settings.publicUrl ? c.bold(st.settings.publicUrl) : c.dim('未填（按当前 IP + 端口访问）')));
   say('  系统服务  ' + svc);
   say('  防火墙    ' + firewall.describe({ host, port }));
   if (pendingRestart(st)) {
@@ -194,6 +195,7 @@ async function actStart(st) {
 }
 
 function dimHint(st) {
+  if (st.settings.publicUrl) say('    公网    ' + st.settings.publicUrl);
   const lan = [];
   if (!isLoopback(st.settings.host)) {
     for (const a of networkUrls(st.port)) lan.push(a);
@@ -357,6 +359,7 @@ async function actAccess() {
       ? (a.enabled ? c.green('已设置 · 校验开启') : c.yellow('已设置 · 校验关闭'))
       : c.yellow('未设置')));
     say('  免密范围  ' + (a.onlyRemote === false ? '所有访问都要密码' : '仅非本机需要密码（本机 ' + c.dim('127.0.0.1') + ' 免密）'));
+    say('  公网地址  ' + (st.settings.publicUrl ? c.bold(st.settings.publicUrl) : c.dim('未填（按当前 IP + 端口访问）')));
     if (pendingRestart(st)) say('  ' + c.yellow('! 监听配置已改，需要重启才生效'));
     say('');
     say('   1) 设置 / 修改访问密码');
@@ -366,6 +369,7 @@ async function actAccess() {
     say('   5) 监听地址改为 ' + (isLoopback(host) ? '所有网络 0.0.0.0' : '仅本机 127.0.0.1'));
     say('   6) 修改端口（当前 ' + port + '）');
     say('   7) 同步防火墙规则（' + firewall.describe({ host, port }) + '）');
+    say('   8) ' + (st.settings.publicUrl ? '修改公网访问地址' : '设置公网访问地址（域名）'));
     say('  ' + c.dim('  0) 返回主菜单'));
     say('');
 
@@ -380,6 +384,7 @@ async function actAccess() {
       else if (a1 === '5') await setHost(st);
       else if (a1 === '6') await setPort(st);
       else if (a1 === '7') await applyFirewall(st, host, port);
+      else if (a1 === '8') await setPublicUrl(st);
       else warn('没有这个选项');
     } catch (e) {
       bad(e.message || String(e));
@@ -479,6 +484,34 @@ async function setPort(st) {
   ok('端口已保存为 ' + n + '（原 ' + cur + '）');
   await applyFirewall(st, paths.normalizeHost(st.settings.host), n);
   await offerRestart(st);
+}
+
+/**
+ * 公网访问地址（域名 / 反代）。
+ * 只用来显示和「重启后跳到哪」，不参与监听，所以直接写配置文件、不需要重启；
+ * 界面下次拉 bootstrap 就会读到新值。
+ */
+async function setPublicUrl(st) {
+  const cur = st.settings.publicUrl || '';
+  say('  ' + c.dim('填对外的域名或反向代理地址，例如 mc.example.com、https://mc.example.com；'));
+  say('  ' + c.dim('只影响「显示哪个地址」和「改端口重启后跳到哪」，不改变监听，保存即生效。'));
+  const raw = await ask('  公网地址' + (cur ? `（当前 ${cur}，回车保留，输入 - 清除）：` : '（回车取消）：'));
+  if (!raw) { warn('已取消'); return; }
+  if (raw.trim() === '-' || raw.trim() === '0') {
+    paths.writeSettings({ publicUrl: '' });
+    ok('已清除公网地址，之后按当前 IP + 端口访问');
+    return;
+  }
+  let v;
+  try { v = paths.normalizePublicUrl(raw); } catch (e) { bad(e.message); return; }
+  paths.writeSettings({ publicUrl: v });
+  ok('公网访问地址已保存为 ' + v);
+  const s2 = paths.readSettings();
+  if (isLoopback(paths.normalizeHost(s2.host))) {
+    info('当前只听本机。域名要能访问到面板，需要反代指向 127.0.0.1:' + (Number(s2.port) || 8720));
+  } else {
+    info('确认 DNS 或端口映射把这个域名指到本机的 ' + (Number(s2.port) || 8720) + ' 端口；防火墙已由菜单 7) 处理');
+  }
 }
 
 /** 配置改了但没生效时，问一句要不要现在重启 */

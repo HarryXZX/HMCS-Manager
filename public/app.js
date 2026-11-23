@@ -1364,6 +1364,8 @@ async function viewSettings(i) {
   const wantPort = Number(s.port) || runPort;
   const pendingRestart = wantHost !== runHost || wantPort !== runPort;
   const urls = net.urls || [];
+  // 用户自己填的公网地址（域名 / 反代）；留空就按当前访问地址拼
+  const publicUrl = s.publicUrl || net.publicUrl || '';
   const lanOnly = runHost === '127.0.0.1' || runHost === '::1';
   const suAdded = (su.added || []).map(a => `${a.protocol} ${a.externalPort} → ${a.internalClient || '?'}:${a.internalPort}`).join('，');
 
@@ -1388,6 +1390,17 @@ async function viewSettings(i) {
           当前运行：<span class="mono">${esc(runHost)}:${esc(runPort)}</span>${pendingRestart ? '　→ 已保存为 <span class="mono">' + esc(wantHost) + ':' + esc(wantPort) + '</span>' : ''}</div>
         <div class="tip" id="s-host-warn" style="color:#f0c674"></div>
         <div class="tip" id="s-fw-tip"></div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="form-row"><label>公网访问地址（可选，域名 / 反向代理）</label>
+          <div class="path-row">
+            <input id="s-public-url" value="${esc(publicUrl)}" placeholder="mc.example.com 或 https://mc.example.com:8720" spellcheck="false">
+            <button class="btn sm ghost" id="s-public-copy"${publicUrl ? '' : ' disabled'}>复制</button>
+          </div>
+          <div class="tip">自己填的对外地址。填了以后：概览页、命令行状态优先显示它，<b>改端口重启后页面也跳到它</b>（不再拼 IP:端口，适合挂在 Nginx / Caddy / CDN 后面）。
+            只支持 <span class="mono">http://</span> / <span class="mono">https://</span>，可带端口和路径前缀；留空则按当前访问地址走。保存后立即生效，不用重启。</div>
+        </div>
       </div>
 
       ${pendingRestart ? `
@@ -1694,27 +1707,55 @@ async function viewSettings(i) {
   if (hostSel) { hostSel.onchange = () => { hostWarn(); fwTip(); }; hostWarn(); }
   fwTip();
 
+  const copyBtn = $('#s-public-copy');
+  if (copyBtn) copyBtn.onclick = async () => {
+    const el = $('#s-public-url');
+    const v = el ? el.value.trim() : '';
+    if (!v) return;
+    try {
+      await navigator.clipboard.writeText(v);
+      toast('已复制：' + v);
+    } catch {
+      // 非 https 环境没有 clipboard API，退回到选区复制
+      try { el.select(); document.execCommand('copy'); toast('已复制：' + v); }
+      catch { toast('复制失败，请手动选中复制', 'err'); }
+    }
+  };
+
   // ---- 一键重启（改完监听地址 / 端口就不用回命令行了）
   const restartBtn = $('#s-restart');
   if (restartBtn) restartBtn.onclick = async () => {
     const runningInst = (state.boot.instances || []).filter(i => i.runtime && i.runtime.status !== 'stopped');
     const names = runningInst.map(i => i.name).join('、');
 
-    // 重启后页面要落到哪儿：端口变了就换端口，改成仅本机就只能走回环地址
+    // 重启后页面要落到哪儿：
+    //   1) 改成「仅本机」→ 只能走回环 + 新端口（不管有没有填域名）
+    //   2) 填了公网地址、且当前不是从本机访问 → 跳用户填的地址
+    //      （挂在反代 / CDN 后面时，面板内部端口怎么改，对外地址都不变）
+    //   3) 其它情况 → 当前 host + 新端口（老行为）
     const herePort = Number(location.port) || (location.protocol === 'https:' ? 443 : 80);
     const portChanging = Number(wantPort) !== herePort;
     const hereIsLoopback = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(location.hostname);
     const goingLocalOnly = !hereIsLoopback && wantHost === '127.0.0.1';
+    const tabHash = '#' + (state.tab || 'settings');
+    const pubOrigin = originOf(publicUrl);
+    const onPublicHost = !!pubOrigin && pubOrigin === location.origin;
     let nextUrl = '';
-    if (portChanging || goingLocalOnly) {
-      const host = goingLocalOnly ? '127.0.0.1' : location.hostname;
-      nextUrl = `${location.protocol}//${host}:${wantPort}${location.pathname}${location.search}#${state.tab || 'settings'}`;
+    let fallbackUrl = '';   // 域名在内网打不开时的直连地址
+    if (goingLocalOnly) {
+      nextUrl = `http://127.0.0.1:${wantPort}/${tabHash}`;
+    } else if (publicUrl && !hereIsLoopback && !onPublicHost) {
+      nextUrl = publicUrl.replace(/\/+$/, '') + '/' + tabHash;
+      fallbackUrl = `http://${location.hostname}:${wantPort}/${tabHash}`;
+    } else if (portChanging && !onPublicHost) {
+      nextUrl = `${location.protocol}//${location.hostname}:${wantPort}/${tabHash}`;
     }
 
     let tip = runningInst.length
       ? `重启会先安全关闭正在运行的 ${runningInst.length} 个服务端（${names}），等它们写完存档再退出。`
       : '重启期间页面会断开几秒，之后自动恢复。';
     if (nextUrl) tip += `\n\n新地址是 ${nextUrl}，页面会自动跳过去。`;
+    if (fallbackUrl) tip += `\n如果这个域名在这台机器上打不开（内网回不到公网），用直连地址：${fallbackUrl}`;
     if (goingLocalOnly) tip += '\n\n注意：改成「仅本机」以后，用局域网 / 公网地址就再也进不来了，只能在这台机器上开。';
     tip += '\n\n确定现在重启？';
     if (!window.confirm(tip)) return;
@@ -1732,7 +1773,18 @@ async function viewSettings(i) {
     catch { /* 进程退得比响应快时连接会断，这不是失败 */ }
 
     if (stateEl) stateEl.textContent = '正在等待 HMCS 重新启动…';
-    const up = await waitForRestart(beforePid, portChanging ? wantPort : 0);
+    const targetOrigin = originOf(nextUrl);
+    // HTTPS 页面跳到本机 HTTP 时浏览器会拦混合内容，探活必然失败，直接等几秒跳
+    const mixed = targetOrigin.startsWith('http://') && location.protocol === 'https:';
+    const up = mixed ? true : await waitForRestart(beforePid, { port: wantPort, origin: targetOrigin });
+    if (mixed) {
+      // HTTPS 页面上 fetch http://127.0.0.1 会被浏览器当混合内容拦掉，探不到也跳不过去验证
+      if (stateEl) {
+        stateEl.innerHTML = `HTTPS 页面无法探测本机端口，5 秒后自动跳转；没打开就点这里：<a href="${esc(nextUrl)}">${esc(nextUrl)}</a>`;
+      }
+      setTimeout(() => location.replace(nextUrl), 5000);
+      return;
+    }
     if (up) {
       if (nextUrl) {
         if (stateEl) stateEl.textContent = '已重启，正在跳转到 ' + nextUrl;
@@ -1872,6 +1924,7 @@ async function viewSettings(i) {
           extraWorldDirs: extraDirs,
           host: hostSel ? hostSel.value : undefined,
           port: $('#s-port') ? Number($('#s-port').value) : undefined,
+          publicUrl: $('#s-public-url') ? $('#s-public-url').value.trim() : undefined,
         },
       });
       state.boot.settings = r.settings;
@@ -1895,21 +1948,32 @@ async function viewSettings(i) {
 }
 
 /**
+ * 从绝对地址里取 origin（scheme://host:port）；相对地址或非法值返回 ''。
+ * 判断「跳转目标是不是另一个源」全靠它。
+ */
+function originOf(u) {
+  if (!u) return '';
+  try { return new URL(String(u), location.href).origin; } catch { return ''; }
+}
+
+/**
  * 等 HMCS 重启回来再刷新页面。
  *
  * 判定「回来了」必须看 pid 变化：旧进程在关闭过程中 ping 可能还短暂可用，
  * 只看 HTTP 200 会立刻当成功，刷新后看到的还是旧进程。
  *
- * 端口变了就不一样了：新地址跟老页面不同源，fetch 要跨源读（后端对 ping 放开了 CORS，
- * 但不返回 pid）。这时也不用比 pid —— 旧进程根本不可能监听新端口。
+ * 换了 origin（换端口 / 换域名）就不同源了，fetch 要跨源读（后端对 ping 放开了 CORS，
+ * 但不返回 pid）。这时也不能比 pid —— 旧进程根本不可能监听新地址，
+ * 改为确认「应答的就是新端口」。
+ *
+ * @param {{port?: number, origin?: string}} target 目标内部端口 / 目标源（留空 = 当前页）
  */
-function waitForRestart(prevPid, targetPort = 0, timeoutMs = 60000) {
-  const herePort = Number(location.port) || (location.protocol === 'https:' ? 443 : 80);
-  const port = Number(targetPort) || herePort;
-  const crossPort = port !== herePort;
-  const url = crossPort
-    ? `${location.protocol}//${location.hostname}:${port}/api/system/ping`
-    : '/api/system/ping';
+function waitForRestart(prevPid, { port = 0, origin = '' } = {}, timeoutMs = 60000) {
+  const hereOrigin = location.origin;
+  const targetOrigin = origin || hereOrigin;
+  const cross = targetOrigin !== hereOrigin;
+  const wantPort = Number(port) || 0;
+  const url = cross ? `${targetOrigin}/api/system/ping` : '/api/system/ping';
 
   const t0 = Date.now();
   return new Promise(resolve => {
@@ -1919,8 +1983,8 @@ function waitForRestart(prevPid, targetPort = 0, timeoutMs = 60000) {
         const r = await fetch(url, { cache: 'no-store' });
         if (r.ok) {
           const d = await r.json();
-          if (crossPort) {
-            if (d && d.ok && Number(d.port) === port) return resolve(true);
+          if (cross) {
+            if (d && d.ok && (!wantPort || Number(d.port) === wantPort)) return resolve(true);
           } else if (d && d.ok && d.pid && d.pid !== prevPid) {
             return resolve(true);
           }
