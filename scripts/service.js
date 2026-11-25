@@ -30,6 +30,7 @@ const path = require('path');
 const os = require('os');
 const http = require('http');
 const { spawnSync } = require('child_process');
+const INSTALL = require('./install-state');
 
 const ROOT = path.resolve(__dirname, '..');
 const APP = path.join(ROOT, 'app.js');
@@ -322,18 +323,72 @@ function execArgs() {
 function quoteWin(s) { return /[\s"]/.test(s) ? `"${s}"` : s; }
 
 // ================================================================== Windows
+const WIN_CACHE = { at: 0, value: null };
+
 const WIN = {
+  /** 任务定义文件：纯文件读取，不用外部程序、不用提权，是最硬的存在性证据 */
+  taskFilePath() {
+    const sysroot = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
+    return path.join(sysroot, 'System32', 'Tasks', WIN_TASK);
+  },
+
+  /** true 存在 / false 明确不存在 / null 读不到（权限！不能当成不存在） */
+  readTaskFile() {
+    try { return fs.statSync(WIN.taskFilePath()).isFile() ? true : false; }
+    catch (e) { return e && e.code === 'ENOENT' ? false : null; }
+  },
+
+  /**
+   * 关键修复：旧代码用 try/catch 把任何异常一律吞成 MISSING，
+   * 任何异常（PowerShell 被策略禁用、cmdlet 不存在、权限不足、spawn 失败）
+   * 都会被吞成 MISSING，于是「查不了」被当成「没安装」。
+   * 现在先确认 cmdlet 存在，再用 SilentlyContinue 区分「任务不存在」与「接口不可用」，
+   * 输出固定 ASCII 标记，避开中英文系统本地化差异。
+   */
+  probePowerShell() {
+    const script = "$ErrorActionPreference='SilentlyContinue'; "
+      + "if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) { 'HMCS_UNAVAILABLE' } "
+      + "else { $t=@(Get-ScheduledTask -TaskName '" + WIN_TASK + "' -ErrorAction SilentlyContinue); "
+      + "if ($t.Count -eq 0) { 'HMCS_ABSENT' } else { 'HMCS_STATE=' + $t[0].State } }";
+    return INSTALL.parsePowerShellProbe(run('powershell', ['-NoProfile', '-NonInteractive', '-Command', script]));
+  },
+
+  probeSchtasks() {
+    return INSTALL.classifySchtasks(run('schtasks', ['/Query', '/TN', WIN_TASK]));
+  },
+
+  /** 多源交叉判定；同一次进程里短缓存，避免 enabled() 连查两次外部命令 */
+  resolve() {
+    // 自测注入口：用假证据跑完整 CLI 链路，不触发 PowerShell / schtasks。
+    // 沙箱和 CI 里这两个外部命令常被策略禁用，注入后仍可验证遥控器显示。
+    const fake = String(process.env.HMCS_TEST_TASK_EVIDENCE || '').trim();
+    if (fake) {
+      try {
+        const v = INSTALL.resolveWindowsInstall(JSON.parse(fake));
+        WIN_CACHE.value = v;
+        WIN_CACHE.at = Date.now();
+        return v;
+      } catch { /* 无效 JSON 就按真实采集走 */ }
+    }
+    if (WIN_CACHE.value && Date.now() - WIN_CACHE.at < 800) return WIN_CACHE.value;
+    const ps = WIN.probePowerShell();
+    const taskFile = WIN.readTaskFile();
+    let sch = 'unavailable';
+    // 精确状态已拿到、或旁路证据已足够定性时，不再多跑一次外部命令
+    if (ps.kind !== 'state' && !(ps.kind === 'absent' && taskFile === false) && taskFile !== true) {
+      sch = WIN.probeSchtasks();
+    }
+    const value = INSTALL.resolveWindowsInstall({ ps, taskFile, saved: SAVED, schtasks: sch });
+    WIN_CACHE.value = value;
+    WIN_CACHE.at = Date.now();
+    return value;
+  },
+
+  invalidate() { WIN_CACHE.at = 0; WIN_CACHE.value = null; },
+
+  /** 兼容旧调用点（uninstall/start/hardStop/enabled 都拿它和 'MISSING' 比） */
   state() {
-    const ps = run('powershell', ['-NoProfile', '-NonInteractive', '-Command',
-      `try { (Get-ScheduledTask -TaskName '${WIN_TASK}' -ErrorAction Stop).State } catch { 'MISSING' }`]);
-    const s = (ps.out || '').trim().split(/\r?\n/).pop() || '';
-    if (['Ready', 'Running', 'Disabled', 'Queued'].includes(s)) return s;
-    if (s === 'MISSING') return 'MISSING';
-    // PowerShell 不可用（被策略禁用 / 极老系统）时退回 schtasks，输出是本地化的，只做存在性判断
-    const q = run('schtasks', ['/Query', '/TN', WIN_TASK]);
-    if (q.code === 0) return 'Ready';
-    if (/cannot find|找不到|不存在|does not exist/i.test(q.err + q.out)) return 'MISSING';
-    return 'UNKNOWN';
+    return WIN.resolve().state;
   },
 
   install() {
@@ -344,6 +399,7 @@ const WIN = {
       die('注册计划任务失败：' + (r.err || r.out || r.error || '未知错误') +
         '\n  提示：请用「以管理员身份运行」打开终端后重试。');
     }
+    WIN.invalidate();
     return true;
   },
 
@@ -352,6 +408,7 @@ const WIN = {
     run('schtasks', ['/End', '/TN', WIN_TASK]);
     const r = run('schtasks', ['/Delete', '/TN', WIN_TASK, '/F']);
     if (r.code !== 0) throw new Error(r.err || r.out || '删除计划任务失败');
+    WIN.invalidate();
     return true;
   },
 
@@ -382,30 +439,26 @@ const WIN = {
   enable() {
     const r = run('schtasks', ['/Change', '/TN', WIN_TASK, '/ENABLE']);
     if (r.code !== 0) throw new Error(r.err || r.out || '开启开机自启失败');
+    WIN.invalidate();
   },
   disable() {
     const r = run('schtasks', ['/Change', '/TN', WIN_TASK, '/DISABLE']);
     if (r.code !== 0) throw new Error(r.err || r.out || '关闭开机自启失败');
+    WIN.invalidate();
   },
   enabled() {
     return WIN.state() !== 'Disabled' && WIN.state() !== 'MISSING';
   },
   describe() {
-    const st = WIN.state();
-    const can = canInstall();
-    if (st === 'UNKNOWN') {
-      return {
-        installed: false, running: false, autostart: false, canInstall: can,
-        raw: '无法查询（PowerShell 与 schtasks 均不可用）',
-        kind: `计划任务「${WIN_TASK}」（SYSTEM / 开机启动）`,
-      };
-    }
+    const d = WIN.resolve();
     return {
-      installed: st !== 'MISSING',
-      running: st === 'Running',
-      autostart: st !== 'Disabled' && st !== 'MISSING',
-      canInstall: can,
-      raw: st === 'MISSING' ? '未安装' : st,
+      installed: d.installed,
+      running: d.running,
+      autostart: d.installed && d.autostart,
+      canInstall: canInstall(),
+      raw: d.raw,
+      installSource: d.source,
+      installUncertain: d.uncertain,
       kind: `计划任务「${WIN_TASK}」（SYSTEM / 开机启动）`,
     };
   },
@@ -657,6 +710,8 @@ async function cmdStatus() {
       installed: d.installed,
       running: d.running,
       autostart: d.autostart,
+      installSource: d.installSource || '',
+      installUncertain: !!d.installUncertain,
       canInstall: !!d.canInstall,
       kind: d.kind,
       raw: d.raw,
@@ -676,8 +731,11 @@ async function cmdStatus() {
   say(c.bold('  HMCS 服务状态'));
   line();
   say('  方式      ' + d.kind);
-  say('  安装      ' + (d.installed ? c.green('是') : c.dim('否')));
-  say('  运行      ' + (d.running ? c.green('运行中') : c.dim('未运行')) + c.dim('  (' + d.raw + ')'));
+  say('  安装      ' + (d.installed ? c.green('是') : c.dim('否'))
+    + (d.installUncertain ? c.yellow('  · 实时状态未确认') : ''));
+  say('  判定依据  ' + c.dim(d.installSource || '—'));
+  say('  运行      ' + ((d.running || ping.ok) ? c.green('运行中') : c.dim('未运行'))
+    + c.dim('  (' + d.raw + ')'));
   say('  开机自启  ' + (d.autostart ? c.green('开启') : c.dim('关闭')));
   say('  监听      ' + HOST + ':' + PORT + (LOCAL_ONLY ? c.yellow('  （仅本机）') : ''));
   if (live && live !== PORT) {

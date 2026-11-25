@@ -20,6 +20,7 @@ const path = require('path');
 const os = require('os');
 const http = require('http');
 const { spawnSync } = require('child_process');
+const INSTALL = require('./install-state');
 
 const ROOT = path.resolve(__dirname, '..');
 const SERVICE = path.join(__dirname, 'service.js');
@@ -103,17 +104,14 @@ function runService(args, { inherit = true } = {}) {
   });
 }
 
-/** 机器可读的现状：装没装、跑没跑、有没有权限装 */
+/** 机器可读的现状：装没装、跑没跑、有没有权限装（解析失败明确标 probeFailed） */
 function probe() {
   const r = runService(['status', '--json'], { inherit: false });
-  const out = String((r && r.stdout) || '').trim();
-  const last = out.split(/\r?\n/).filter(Boolean).pop() || '';
-  try {
-    const o = JSON.parse(last);
-    return o && typeof o === 'object' ? o : null;
-  } catch {
-    return null;
-  }
+  return INSTALL.parseProbeOutput(
+    r && r.stdout,
+    r ? (r.status === null ? -1 : r.status) : -1,
+    r && r.error ? r.error.message : ''
+  );
 }
 
 function ping(port, host) {
@@ -231,6 +229,22 @@ async function bootByService(boot, settings) {
   const port = Number(settings.port) || 8720;
   const host = String(settings.host || '127.0.0.1');
   const p = probe();
+
+  // 状态查询本身失败：既不重复注册服务，也不贸然起第二个实例。
+  // 端口有应答就判定「已在运行」，直接返回，不改动任何东西。
+  if (p && p.probeFailed) {
+    say('  服务安装状态无法确定：' + (p.reason || '查询失败'));
+    if (await waitUp(port, host, 2)) {
+      say('  但服务端口有应答，判定为已在运行，不做任何改动');
+      printReady({
+        port, host, already: true,
+        mode: '状态未知（端口有应答）',
+        info: await httpJson(port, '/api/system/info'),
+      });
+      return 0;
+    }
+    return startDetached(boot, settings, port, host, '服务状态查询失败，已跳过自动注册');
+  }
 
   // 已经按这个端口在跑 → 不折腾
   if (p && p.up && Number(p.bind && p.bind.port) === port && String(p.bind && p.bind.host) === host) {

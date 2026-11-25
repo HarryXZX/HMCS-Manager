@@ -21,6 +21,7 @@ const auth = require('../lib/auth');
 const firewall = require('../lib/firewall');
 const pkg = require('../package.json');
 const launch = require('./launch');
+const INSTALL = require('./install-state');
 const { ask, askHidden, confirm } = require('./prompt');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -59,17 +60,14 @@ function runCli(args) {
   return r.status === null ? 0 : r.status;
 }
 
-/** 服务管理器给出的机器可读现状 */
+/** 服务管理器给出的机器可读现状（解析失败时明确标 probeFailed，不再静默当成「未安装」） */
 function probe() {
   const r = spawnSync(NODE, [SERVICE, 'status', '--json'], { cwd: ROOT, encoding: 'utf8', timeout: 60000 });
-  const out = String((r && r.stdout) || '').trim();
-  const last = out.split(/\r?\n/).filter(Boolean).pop() || '';
-  try {
-    const o = JSON.parse(last);
-    return o && typeof o === 'object' ? o : null;
-  } catch {
-    return null;
-  }
+  return INSTALL.parseProbeOutput(
+    r && r.stdout,
+    r ? (r.status === null ? -1 : r.status) : -1,
+    r && r.error ? r.error.message : ''
+  );
 }
 
 /** 本机 HTTP 调用（带 control token，等价于本机运维身份） */
@@ -116,7 +114,7 @@ async function snapshot() {
   const settings = paths.readSettings();
   const port = Number(settings.port) || 8720;
   const infoRes = await api('/api/system/info', { port, token: auth.controlToken(), timeout: 2500 });
-  const d = probe() || {};
+  const d = probe();
   const live = infoRes.status === 200 && infoRes.json && infoRes.json.app ? infoRes.json : null;
   return {
     settings,
@@ -126,6 +124,10 @@ async function snapshot() {
     up: !!live,
     installed: !!d.installed,
     autostart: !!d.autostart,
+    installUncertain: !!d.installUncertain,
+    installSource: d.installSource || '',
+    probeFailed: !!d.probeFailed,
+    probeReason: d.reason || '',
     kind: d.kind || '',
     canInstall: d.canInstall !== false,
   };
@@ -145,9 +147,13 @@ function renderStatus(st) {
   const runUrl = st.up && st.bind ? `${st.bind.host}:${st.bind.port}` : '';
   const pwd = a.hash ? (a.enabled ? c.green('已启用') : c.yellow('已设置·未启用')) : c.yellow('未设置');
   const scope = a.onlyRemote === false ? '所有访问都要密码' : '本机免密';
-  const svc = st.installed
-    ? c.green('已安装') + (st.autostart ? c.green(' · 开机自启') : c.dim(' · 不自启')) + (st.kind ? c.dim('（' + st.kind + '）') : '')
-    : c.dim('未安装（当前以独立后台进程运行）');
+  const svc = st.probeFailed
+    ? c.yellow('状态未知（服务查询失败，未改动任何服务）')
+    : st.installed
+      ? c.green('已安装') + (st.autostart ? c.green(' · 开机自启') : c.dim(' · 不自启'))
+        + (st.installUncertain ? c.yellow(' · 实时状态未确认') : '')
+        + (st.kind ? c.dim('（' + st.kind + '）') : '')
+      : c.dim('未安装（当前以独立后台进程运行）');
 
   say('');
   line();
@@ -160,6 +166,7 @@ function renderStatus(st) {
   say('  访问密码  ' + pwd);
   say('  公网地址  ' + (st.settings.publicUrl ? c.bold(st.settings.publicUrl) : c.dim('未填（按当前 IP + 端口访问）')));
   say('  系统服务  ' + svc);
+  if (st.installSource) say('  判定依据  ' + c.dim(st.installSource));
   say('  防火墙    ' + firewall.describe({ host, port }));
   if (pendingRestart(st)) {
     say('  ' + c.yellow('! 监听配置已改，重启后才生效') + c.dim(`（运行 ${st.bind.host}:${st.bind.port} → 目标 ${host}:${port}）`));
@@ -237,6 +244,11 @@ async function actRestart(st) {
 }
 
 async function actInstall(st) {
+  if (st.probeFailed) {
+    warn('服务安装状态无法确定（' + (st.probeReason || '查询失败') + '）。');
+    warn('为避免重复注册，请先选 12) 查看详细状态确认后再安装。');
+    return;
+  }
   if (!st.canInstall) {
     if (IS_WIN) {
       say('  ' + c.dim('安装系统服务需要管理员权限，正在请求提权…'));
@@ -253,6 +265,7 @@ async function actInstall(st) {
 }
 
 async function actUninstall(st) {
+  if (st.probeFailed) { warn('无法确定服务安装状态，请先选 12) 查看详细状态确认后再卸载'); return; }
   if (!st.installed) { warn('系统服务未安装，无需卸载'); return; }
   if (!(await confirm('  确认卸载系统服务？进程会先停掉，配置与实例文件都保留', false))) { warn('已取消'); return; }
   runService(['uninstall']);
