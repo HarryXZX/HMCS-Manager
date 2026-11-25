@@ -260,7 +260,7 @@ async function bootByService(boot, settings) {
     return startDetached(boot, settings, port, host, '按 HMCS_NO_SERVICE 要求跳过了系统服务');
   }
 
-  if (p && p.installed) {
+  if (INSTALL.shouldUseServiceManager(p)) {
     // 服务处于 active 就 restart：改了端口时 start 是空操作，
     // 旧进程会一直蹲在老端口上，看起来像「设置没生效」。
     const running = p.running || p.up;
@@ -275,6 +275,13 @@ async function bootByService(boot, settings) {
     }
     printReady({ port, host, mode: (probe() || p).kind, info: await httpJson(port, '/api/system/info') });
     return 0;
+  }
+
+  // 只有存档佐证、无法实时确认：既不能交给服务管理器（任务查不到），
+  // 也不能贸然 install（可能重复注册），直接后台拉起即可。
+  if (p && p.installed && p.installUncertain) {
+    say('  计划任务状态无法实时确认，跳过自动注册，直接启动后台进程…');
+    return startDetached(boot, settings, port, host, '计划任务状态无法实时确认');
   }
 
   // 还没注册：先看这个身份有没有权限装（Windows 装计划任务要管理员），

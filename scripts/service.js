@@ -893,8 +893,25 @@ function dryRunPlan() {
 }
 
 async function safeStart() {
-  try { BACKEND.start(); }
-  catch (e) { bad(e.message); }
+  try { BACKEND.start(); return true; }
+  catch (e) { bad(e.message); return false; }
+}
+
+/** 直接拉起 app.js：不依赖任何服务管理器，是启动的最终兜底路径 */
+async function startAsBackground(reason) {
+  say(c.dim('  ' + reason + '，改为启动独立后台进程（关终端不影响）…'));
+  const r = require('./launch').spawnDetached({ port: PORT, host: HOST });
+  if (!r.ok) { bad('后台启动失败：' + r.error); process.exitCode = 1; return false; }
+  for (let i = 0; i < 30; i++) {
+    await sleep(500);
+    if (await isUp()) {
+      ok('已启动（独立后台进程 pid=' + r.pid + '）：http://127.0.0.1:' + PORT);
+      return true;
+    }
+  }
+  bad('进程已拉起（pid ' + r.pid + '），但 15 秒内端口没响应，看日志 ' + path.join(LOG_DIR, 'manager.log'));
+  process.exitCode = 1;
+  return false;
 }
 
 async function cmdStart() {
@@ -906,31 +923,24 @@ async function cmdStart() {
     return;
   }
 
-  // 没注册服务也能启动：退化成独立后台进程（关终端不影响）。
-  // 先装服务再启动太绕了 —— 「启动」本来就该直接能把面板跑起来。
-  if (!d.installed) {
-    say(c.dim('  服务尚未安装，改为启动独立后台进程（要开机自启再执行 install）…'));
-    const r = require('./launch').spawnDetached({ port: PORT, host: HOST });
-    if (!r.ok) { bad('后台启动失败：' + r.error); process.exitCode = 1; return; }
-    for (let i = 0; i < 30; i++) {
-      await sleep(500);
-      if (await isUp()) {
-        ok('已启动（独立后台进程 pid=' + r.pid + '）：http://127.0.0.1:' + PORT);
-        return;
-      }
-    }
-    bad('进程已拉起（pid ' + r.pid + '），但 15 秒内端口没响应，看日志 ' + path.join(LOG_DIR, 'manager.log'));
-    process.exitCode = 1;
+  // 关键：只有「实时确认任务已注册」才交给服务管理器。
+  // 仅有安装存档 / 查询接口不可用时，任务本来就是查不到的那一环，
+  // 再走 schtasks /Run 只会报「启动失败」；直接拉起 app.js 才一定可用。
+  if (!INSTALL.shouldUseServiceManager(d)) {
+    await startAsBackground(d.installed ? '计划任务状态无法实时确认' : '服务尚未安装（要开机自启再执行 install）');
     return;
   }
 
-  await safeStart();
+  if (!(await safeStart())) {
+    await startAsBackground('服务管理器启动失败，自动回退');
+    return;
+  }
   for (let i = 0; i < 20; i++) {
     await sleep(500);
     if (await isUp()) { ok('已启动：http://127.0.0.1:' + PORT); return; }
   }
-  bad('启动后 10 秒仍无响应，请查看日志 ' + path.join(LOG_DIR, 'manager.log'));
-  process.exitCode = 1;
+  warn('服务管理器已执行，但 10 秒内端口无响应');
+  await startAsBackground('自动回退');
 }
 
 /** 等某个端口彻底不响应 */
@@ -982,7 +992,14 @@ async function cmdRestart() {
 function cmdUninstall() {
   const d = BACKEND.describe();
   if (!d.installed) { warn('服务未安装，无需卸载'); return; }
-  BACKEND.uninstall();
+  try { BACKEND.uninstall(); }
+  catch (e) {
+    // 只有存档佐证、实时查不到任务时，任务可能早已被手工删掉：
+    // 清掉过期存档即可，不要误报「卸载失败」
+    if (d.installUncertain && /删除|找不到|不存在|cannot find|does not exist|失败/i.test(e.message)) {
+      warn('计划任务已不存在，改为清理过期的安装存档');
+    } else throw e;
+  }
   try { fs.unlinkSync(STATE_FILE); } catch { /* 本来就没有 */ }
   ok('服务已卸载（数据与实例文件都保留了）');
 }

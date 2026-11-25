@@ -168,9 +168,23 @@ function parseProbeOutput(stdout, exitCode, error) {
   return parsed;
 }
 
+/**
+ * 是否可以把「启动 / 重启」交给服务管理器。
+ *
+ * installed 只是**展示语义**（查不到任务但有安装存档时仍显示「已安装」），
+ * 启动决策必须更严格：只有实时确认任务存在（uncertain=false、非 probeFailed）
+ * 才能走 schtasks /Run、systemctl start 之类的路径。否则任务本来就是
+ * 「查不到的那一环」，交给它只会报「启动失败」—— 这时候直接拉起 app.js
+ * 才是 100% 可用的路径。
+ */
+function shouldUseServiceManager(d) {
+  return !!(d && d.installed === true && d.installUncertain !== true && d.probeFailed !== true);
+}
+
 module.exports = {
   parsePowerShellProbe,
   classifySchtasks,
   resolveWindowsInstall,
   parseProbeOutput,
+  shouldUseServiceManager,
 };

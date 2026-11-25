@@ -226,9 +226,40 @@ section('6. 源码接线静态断言');
   check('menu.js 状态区分「状态未知」', /状态未知/.test(menu));
   check('hmcsm.js 有 probeFailed 保守分支', /probeFailed/.test(hmc));
   check('纯逻辑模块含判定表', /resolveWindowsInstall/.test(state));
-  check('版本号 0.3.11', pkg.version === '0.3.11', pkg.version);
+  check('版本号 0.3.12', pkg.version === '0.3.12', pkg.version);
   // 本次热修复不得触碰服务端本体
   check('新逻辑模块在 scripts/ 下（不碰 app.js）', fs.existsSync(path.join(ROOT, 'scripts', 'install-state.js')));
+}
+
+// ---------------------------------------------------------------- 7
+section('7. 启动决策语义（回归：installed 只用于展示，uncertain 用于决策）');
+{
+  check('实时确认已安装 → 交给服务管理器',
+    I.shouldUseServiceManager({ installed: true, installUncertain: false }) === true);
+  check('★ 存档佐证但不确定 → 不交给服务管理器（否则 schtasks /Run 必失败）',
+    I.shouldUseServiceManager({ installed: true, installUncertain: true }) === false);
+  check('probeFailed → 不交给服务管理器',
+    I.shouldUseServiceManager({ installed: true, probeFailed: true }) === false);
+  check('未安装 → 不交给服务管理器',
+    I.shouldUseServiceManager({ installed: false }) === false);
+  check('空对象 / null → false',
+    I.shouldUseServiceManager({}) === false && I.shouldUseServiceManager(null) === false);
+  check('Linux/mac 实时判定同样适用（无 uncertain 字段）',
+    I.shouldUseServiceManager({ installed: true, running: false }) === true);
+
+  const svc = fs.readFileSync(path.join(ROOT, 'scripts', 'service.js'), 'utf8');
+  const menu = fs.readFileSync(path.join(ROOT, 'scripts', 'menu.js'), 'utf8');
+  const hmc = fs.readFileSync(path.join(ROOT, 'scripts', 'hmcsm.js'), 'utf8');
+
+  check('cmdStart 用 shouldUseServiceManager 决策', /INSTALL\.shouldUseServiceManager\(d\)/.test(svc));
+  check('★ 存在直接拉起 app.js 的后台兜底', /startAsBackground/.test(svc) && /spawnDetached/.test(svc));
+  check('★ 服务管理器失败会自动回退', /自动回退/.test(svc));
+  check('cmdStart 不再单纯按 installed 分支', !/if \(!d\.installed\) \{[\s\S]{0,200}spawnDetached/.test(svc));
+  check('menu actStart 用决策函数', /INSTALL\.shouldUseServiceManager\(st\)/.test(menu));
+  check('menu actRestart 用决策函数', /const useSvc = INSTALL\.shouldUseServiceManager\(st\)/.test(menu));
+  check('hmcsm bootByService 用决策函数', /INSTALL\.shouldUseServiceManager\(p\)/.test(hmc));
+  check('hmcsm 对「已装但不确定」跳过自动注册', /p\.installed && p\.installUncertain/.test(hmc));
+  check('卸载对「仅存档佐证」容错', /installUncertain/.test(svc) && /计划任务已不存在/.test(svc));
 }
 
 console.log('\n' + '='.repeat(48));

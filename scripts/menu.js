@@ -188,9 +188,9 @@ function renderStatus(st) {
 // ------------------------------------------------------------------ 动作：服务
 async function actStart(st) {
   if (st.up) { warn('已经在运行：' + st.bind.host + ':' + st.bind.port); return; }
-  if (st.installed) { runService(['start']); return; }
+  if (INSTALL.shouldUseServiceManager(st)) { runService(['start']); return; }
 
-  info('服务未安装，改为启动独立后台进程（关掉终端也不影响）…');
+  info('服务管理器状态无法实时确认，改为启动独立后台进程（关掉终端也不影响）…');
   // 不传 --host / --port：让 app.js 直接读 settings.json，
   // 否则菜单启动会把配置里的监听地址当命令行参数反向写回去。
   const r = launch.spawnDetached({ recordPort: st.port, recordHost: st.settings.host });
@@ -226,13 +226,14 @@ function networkUrls(port) {
 }
 
 async function actStop(st) {
-  if (!st.up && !st.installed) { warn('当前没有在运行'); return; }
+  if (!st.up && !INSTALL.shouldUseServiceManager(st)) { warn('当前没有在运行'); return; }
   runService(['stop']);
 }
 
 async function actRestart(st) {
-  if (!st.up && !st.installed) { await actStart(st); return; }
-  if (!st.installed) {
+  const useSvc = INSTALL.shouldUseServiceManager(st);
+  if (!st.up && !useSvc) { await actStart(st); return; }
+  if (!useSvc) {
     // 后台进程模式的「重启」= 优雅停 + 再拉一个
     await actStop(st);
     const after = await snapshot();
@@ -248,6 +249,9 @@ async function actInstall(st) {
     warn('服务安装状态无法确定（' + (st.probeReason || '查询失败') + '）。');
     warn('为避免重复注册，请先选 12) 查看详细状态确认后再安装。');
     return;
+  }
+  if (st.installed && st.installUncertain) {
+    warn('安装状态无法实时确认（存档显示已安装）。若确需重装，请先执行 5) 卸载系统服务。');
   }
   if (!st.canInstall) {
     if (IS_WIN) {
